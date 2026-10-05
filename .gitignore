@@ -1,0 +1,10 @@
+# recorded market data and personal settings - keep these off GitHub
+nifty_tracker_data/
+nifty_tracker_settings.json
+# build output
+build/
+dist/
+*.spec
+*.exe
+__pycache__/
+*.pyc
