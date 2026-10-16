@@ -21,7 +21,7 @@ import threading
 import time
 
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal, QUrl, QRectF, QPointF, QLockFile
-from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPen,
+from PySide6.QtGui import (QPixmap, QLinearGradient, QAction, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPen,
                            QBrush, QPainterPath, QFontMetrics, QKeySequence, QShortcut)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QComboBox,
                                QHBoxLayout, QVBoxLayout, QGridLayout, QSplitter, QTabWidget, QTableWidget,
@@ -310,6 +310,55 @@ class ExpiryLoader(QObject):
             self.loaded.emit(sym, items)
         except RuntimeError:
             pass
+
+
+# --------------------------------------------------------------------------- per-index icon
+ICON_STYLE = {"NIFTY": ("#2563eb", "#1e40af", "N"), "BANKNIFTY": ("#7c3aed", "#4c1d95", "BN"),
+              "SENSEX": ("#ea580c", "#9a3412", "S")}
+
+
+def index_icon(sym):
+    """App icon drawn in code: candles on a rounded tile in the index's colour, with its letters.
+    Built at several sizes so the taskbar, title bar and tray all stay sharp."""
+    top, bottom, tag = ICON_STYLE.get(sym, ICON_STYLE["NIFTY"])
+    icon = QIcon()
+    for n in (16, 24, 32, 48, 64, 128, 256):
+        pm = QPixmap(n, n)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        u = n / 64.0
+        grad = QLinearGradient(0, 0, 0, n)
+        grad.setColorAt(0, QColor(top))
+        grad.setColorAt(1, QColor(bottom))
+        p.setPen(Qt.NoPen)
+        p.setBrush(grad)
+        p.drawRoundedRect(QRectF(1 * u, 1 * u, 62 * u, 62 * u), 14 * u, 14 * u)
+        small = n < 32
+        # three candles: green, red, green (fewer, fatter shapes at tiny sizes)
+        candles = [(15, 30, 44, 22, 38, "#34d399"), (30, 22, 46, 26, 40, "#f87171"), (45, 12, 34, 16, 28, "#34d399")] \
+            if not small else [(18, 24, 50, 30, 44, "#34d399"), (44, 12, 40, 16, 34, "#34d399")]
+        w = 9 if not small else 14
+        for x, hi, lo, bt, bb, col in candles:
+            if small:
+                x, hi, lo, bt, bb = x, hi, lo, bt, bb
+            elif tag:
+                hi, lo, bt, bb = hi - 4, lo - 4, bt - 4, bb - 4      # make room for the letters
+            p.setPen(QPen(QColor(col), max(1.0, 2.2 * u)))
+            p.drawLine(QPointF(x * u, hi * u), QPointF(x * u, lo * u))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(col))
+            p.drawRoundedRect(QRectF((x - w / 2) * u, bt * u, w * u, (bb - bt) * u), 1.5 * u, 1.5 * u)
+        if not small:
+            f = QFont("Segoe UI" if os.name == "nt" else "Sans")
+            f.setBold(True)
+            f.setPixelSize(int(13 * u) if len(tag) > 1 else int(14 * u))
+            p.setFont(f)
+            p.setPen(QColor("#ffffff"))
+            p.drawText(QRectF(0, 45 * u, 64 * u, 16 * u), Qt.AlignCenter, tag)
+        p.end()
+        icon.addPixmap(pm)
+    return icon
 
 
 # --------------------------------------------------------------------------- small widgets
@@ -2064,6 +2113,13 @@ class MainWindow(QMainWindow):
     # ---- index choice
     def update_index_labels(self):
         ins = engine.INSTRUMENTS[self.settings["instrument"]]
+        icon = index_icon(self.settings["instrument"])
+        self.setWindowIcon(icon)
+        if hasattr(self, "ideas"):
+            self.ideas.setWindowIcon(icon)
+        if self.tray:
+            self.tray.setIcon(icon)
+            self.tray.setToolTip(f"{APP_NAME} – {ins['label']}")
         self.title.setText(f"{ins['label']} · OI Tracker")
         self.setWindowTitle(f"{APP_NAME} – {ins['label']}")
         self.tiles["nifty"].l.setText(f"{ins['short']} (5-min close)")
