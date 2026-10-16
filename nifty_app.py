@@ -15,18 +15,20 @@ import datetime as dt
 import json
 import math
 import os
+import re
 import sys
 import threading
+import time
 
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal, QUrl, QRectF, QPointF
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPen,
-                           QBrush, QPainterPath, QFontMetrics)
+                           QBrush, QPainterPath, QFontMetrics, QKeySequence, QShortcut)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QComboBox,
                                QHBoxLayout, QVBoxLayout, QGridLayout, QSplitter, QTabWidget, QTableWidget,
                                QTableWidgetItem, QHeaderView, QStyledItemDelegate, QScrollArea, QPlainTextEdit,
                                QDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit, QFileDialog,
                                QDialogButtonBox, QMessageBox, QSystemTrayIcon, QToolButton, QSizePolicy,
-                               QAbstractItemView, QStyle)
+                               QAbstractItemView, QStyle, QProgressBar)
 
 import nifty_oi_tracker as engine
 
@@ -138,6 +140,9 @@ def qss():
     QPushButton, QToolButton {{ background:{T['card']}; border:1px solid {T['line']}; border-radius:8px;
         padding:6px 14px; }}
     QPushButton:hover, QToolButton:hover {{ background:{T['hover']}; }}
+    QToolButton:checkable {{ color:{T['ink2']}; }}
+    QToolButton:checked {{ background:{T['atm']}; border:1px solid {T['accent']}; color:{T['ink']}; }}
+    QToolButton:disabled {{ color:{T['line']}; }}
     QPushButton#primary {{ background:{T['accent']}; color:{T['accent_ink']}; border:none; font-weight:650;
         padding:7px 22px; }}
     QPushButton#primary:hover {{ background:{T['accent']}; }}
@@ -180,6 +185,8 @@ def qss():
     QTabWidget > QStackedWidget > QWidget, QWidget#page {{ background:{T['card']}; }}
     QWidget#page QLabel {{ background:transparent; }}
     QDialog {{ background:{T['bg']}; }}
+    QProgressBar#countdown {{ background:{T['card']}; border:none; max-height:3px; }}
+    QProgressBar#countdown::chunk {{ background:{T['up']}; }}
     """
 
 
@@ -261,11 +268,15 @@ class ExpiryLoader(QObject):
 
 # --------------------------------------------------------------------------- small widgets
 class Tile(QFrame):
-    def __init__(self, label):
+    """Number tile with an intraday sparkline. Flashes green/red when the value moves; click for history."""
+    clicked = Signal()
+
+    def __init__(self, label, spark=True):
         super().__init__()
         self.setObjectName("tile")
+        self.spark = spark
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 9, 12, 9)
+        lay.setContentsMargins(12, 9, 12, 16 if spark else 9)
         lay.setSpacing(1)
         self.l, self.v, self.s = QLabel(label), QLabel("–"), QLabel("")
         self.l.setObjectName("tl")
@@ -275,15 +286,68 @@ class Tile(QFrame):
             lay.addWidget(w)
         lay.addStretch()
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setFixedHeight(82)
+        self.setFixedHeight(92 if spark else 82)
         self.setMinimumWidth(110)
+        self.hist, self.flash_col = [], None
+        self.flash_timer = QTimer(self)
+        self.flash_timer.setSingleShot(True)
+        self.flash_timer.timeout.connect(self._unflash)
 
     def set(self, value, sub="", color=None):
+        old = self.v.text()
         self.v.setText(value)
         self.v.setStyleSheet(f"color:{color};" if color else "")
         fm = QFontMetrics(self.s.font())
         self.s.setText(fm.elidedText(sub, Qt.ElideRight, max(60, self.width() - 26)))
-        self.setToolTip(sub if fm.horizontalAdvance(sub) > self.width() - 26 else "")
+        tip = sub if fm.horizontalAdvance(sub) > self.width() - 26 else ""
+        if self.hist:
+            tip = (tip + "\n" if tip else "") + "Click for today's history"
+        self.setToolTip(tip)
+        self.setCursor(Qt.PointingHandCursor if len(self.hist) > 1 else Qt.ArrowCursor)
+        if old not in ("–", value) and value != "–":
+            try:
+                a, b = float(re.sub(r"[^\d.\-]", "", old)), float(re.sub(r"[^\d.\-]", "", value))
+                self.flash_col = T["up"] if b > a else T["dn"] if b < a else T["accent"]
+            except ValueError:
+                self.flash_col = T["accent"]
+            self.flash_timer.start(1600)
+            self.update()
+
+    def set_history(self, hist):
+        """hist = [(datetime, value or None), ...]"""
+        self.hist = hist
+        self.update()
+
+    def _unflash(self):
+        self.flash_col = None
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and len(self.hist) > 1:
+            self.clicked.emit()
+
+    def paintEvent(self, ev):
+        super().paintEvent(ev)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        vals = [v for _, v in self.hist if v is not None]
+        if self.spark and len(vals) > 1:
+            lo, hi = min(vals), max(vals)
+            r = QRectF(12, self.height() - 16, self.width() - 24, 10)
+            step = r.width() / (len(vals) - 1)
+            path = QPainterPath()
+            for i, v in enumerate(vals):
+                pt = QPointF(r.left() + i * step, r.bottom() - ((v - lo) / (hi - lo) if hi > lo else 0.5) * r.height())
+                path.moveTo(pt) if i == 0 else path.lineTo(pt)
+            col = QColor(T["up"] if vals[-1] >= vals[0] else T["dn"])
+            col.setAlphaF(0.8)
+            p.setPen(QPen(col, 1.4))
+            p.drawPath(path)
+        if self.flash_col:
+            p.setPen(QPen(QColor(self.flash_col), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 10, 10)
+        p.end()
 
 
 class BarDelegate(QStyledItemDelegate):
@@ -311,21 +375,451 @@ class BarDelegate(QStyledItemDelegate):
         p.restore()
 
 
+# --------------------------------------------------------------------------- signal helpers
+def sig_key(s):
+    """Stable id for a signal across refreshes (the dicts can be rebuilt by the engine)."""
+    return f"{s['time']:%Y%m%d%H%M}|{s['kind']}|{s['price']:.2f}"
+
+
+def _num(text):
+    return float(text.replace(",", ""))
+
+
+def plan_levels(s):
+    """(entry, stop, target, taken) for a signal, also for ideas skipped on reward:risk or grade."""
+    p = s.get("plan")
+    if p:
+        return p["entry"], p["stop"], p["target"], True
+    t = s.get("trade") or ""
+    mt, ms = re.search(r"target ([\d,]+(?:\.\d+)?)", t), re.search(r"stop ([\d,]+(?:\.\d+)?)", t)
+    if mt and ms:
+        return s["price"], _num(ms.group(1)), _num(mt.group(1)), False
+    return None
+
+
 # --------------------------------------------------------------------------- candle chart
 class ChartWidget(QWidget):
+    """Candles + OI levels. Scroll = zoom, drag = pan, double-click = reset,
+    click a marker (or a candle with a signal) = select it and draw its entry / stop / target."""
     MARKED = ("BREAKDOWN", "BREAKOUT", "REJECTION", "BOUNCE", "REVERSAL UP", "REVERSAL DOWN",
               "OR BREAKOUT", "OR BREAKDOWN")
+    signal_clicked = Signal(object)          # signal dict, or None to clear
+    view_changed = Signal()
 
     def __init__(self):
         super().__init__()
         self.snaps, self.hover = [], None
         self.setMouseTracking(True)
         self.setMinimumHeight(320)
+        self.setFocusPolicy(Qt.ClickFocus)
         self.empty_text = "Press Start to begin."
+        self.tf = 5                                   # minutes per candle (5 or 15)
+        self.view_n, self.view_off = None, 0          # None = fit the whole day; off = candles hidden on the right
+        self.sel_key = None
+        self.show = {"oi": True, "fresh": True, "or": True, "marks": True}
+        self._press, self._hits, self._geom = None, [], None
 
+    # ---- data / state
     def set_data(self, snaps):
         self.snaps = snaps
         self.update()
+
+    def set_timeframe(self, minutes):
+        self.tf = minutes
+        self.reset_view()
+
+    def set_selected(self, key):
+        self.sel_key = key
+        self.update()
+
+    def toggle(self, name, on):
+        self.show[name] = on
+        self.update()
+
+    def reset_view(self):
+        self.view_n, self.view_off = None, 0
+        self.unsetCursor()
+        self.update()
+        self.view_changed.emit()
+
+    def zoomed(self):
+        return self.view_n is not None
+
+    def bars(self):
+        """Candles at the chosen timeframe: list of dicts {c, snap (last), snaps, dur}."""
+        snaps = [s for s in self.snaps if s.get("candle")]
+        if self.tf == 5:
+            return [{"c": s["candle"], "snap": s, "snaps": [s], "dur": 5} for s in snaps]
+        out, cur_key = [], None
+        for s in snaps:
+            c = s["candle"]
+            k = ((c["start"].hour * 60 + c["start"].minute) - 555) // self.tf
+            if k != cur_key:
+                out.append({"c": dict(c), "snap": s, "snaps": [s], "dur": self.tf})
+                cur_key = k
+            else:
+                b = out[-1]
+                b["c"]["high"] = max(b["c"]["high"], c["high"])
+                b["c"]["low"] = min(b["c"]["low"], c["low"])
+                b["c"]["close"] = c["close"]
+                b["snap"] = s
+                b["snaps"].append(s)
+        return out
+
+    def all_signals(self):
+        return [sig for s in self.snaps for sig in s.get("_signals", [])]
+
+    def selected_signal(self):
+        if not self.sel_key:
+            return None
+        return next((g for g in self.all_signals() if sig_key(g) == self.sel_key), None)
+
+    def zoom(self, factor, anchor=0.5):
+        total = len(self.bars())
+        if total < 2:
+            return
+        start, count = self._window(total)
+        new = int(round((self.view_n or total) * factor))
+        if new >= total:
+            self.reset_view()
+            return
+        new = max(8, new)
+        b = start + anchor * count
+        new_start = max(0, min(total - new, int(round(b - anchor * new))))
+        self.view_n, self.view_off = new, total - (new_start + new)
+        self.setCursor(Qt.OpenHandCursor)
+        self.update()
+        self.view_changed.emit()
+
+    def center_on(self, key):
+        """Scroll a zoomed view so the candle of this signal is visible."""
+        if not self.zoomed():
+            return
+        bars = self.bars()
+        i = self._bar_of(bars, key)
+        if i is None:
+            return
+        start, count = self._window(len(bars))
+        if not (start <= i < start + count):
+            new_start = max(0, min(len(bars) - count, i - count // 2))
+            self.view_off = len(bars) - (new_start + count)
+            self.update()
+
+    def _window(self, total):
+        if self.view_n is None:
+            return 0, total
+        count = min(self.view_n, total)
+        self.view_off = max(0, min(total - count, self.view_off))
+        return total - self.view_off - count, count
+
+    @staticmethod
+    def _bar_of(bars, key):
+        for i, b in enumerate(bars):
+            for s in b["snaps"]:
+                if any(sig_key(g) == key for g in s.get("_signals", [])):
+                    return i
+        return None
+
+    # ---- mouse
+    def leaveEvent(self, e):
+        self.hover = None
+        self.update()
+
+    def wheelEvent(self, e):
+        if not self._geom:
+            return
+        L, cw, start, count, slots, W, R = self._geom
+        anchor = max(0.0, min(1.0, (e.position().x() - L) / max(1, cw * slots)))
+        anchor = min(anchor * slots / max(1, count), 1.0)
+        self.zoom(0.8 if e.angleDelta().y() > 0 else 1.25, anchor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._press = (e.position(), self.view_off)
+            if self.zoomed():
+                self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e):
+        self.hover = e.position()
+        if self._press and self.zoomed() and self._geom and e.buttons() & Qt.LeftButton:
+            cw = self._geom[1]
+            self.view_off = self._press[1] + int((e.position().x() - self._press[0].x()) / max(1, cw))
+        elif not self._press:
+            over = any(r.contains(e.position()) for r, _ in self._hits)
+            self.setCursor(Qt.PointingHandCursor if over else Qt.OpenHandCursor if self.zoomed() else Qt.ArrowCursor)
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.LeftButton or not self._press:
+            return
+        moved = (e.position() - self._press[0]).manhattanLength()
+        self._press = None
+        self.setCursor(Qt.OpenHandCursor if self.zoomed() else Qt.ArrowCursor)
+        if moved > 4:
+            self.view_changed.emit()
+            return
+        for r, sig in self._hits:                       # click on a marker
+            if r.contains(e.position()):
+                self.signal_clicked.emit(sig)
+                return
+        if self._geom:                                  # click on a candle that carries a signal
+            L, cw, start, count, slots, W, R = self._geom
+            i = start + int((e.position().x() - L) / cw)
+            bars = self.bars()
+            if L <= e.position().x() <= W - R and start <= i < start + count:
+                sigs = [g for s in bars[i]["snaps"] for g in s.get("_signals", []) if g["kind"] in self.MARKED]
+                if sigs:
+                    sigs.sort(key=lambda g: (not g.get("plan"), g.get("grade") or "Z"))
+                    self.signal_clicked.emit(sigs[0])
+                    return
+        self.signal_clicked.emit(None)
+
+    def mouseDoubleClickEvent(self, e):
+        self.reset_view()
+
+    # ---- painting
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(T["card"]))
+        self._hits, self._geom = [], None
+        allbars = self.bars()
+        small = QFont(self.font())
+        small.setPointSizeF(8.5)
+        p.setFont(small)
+        fm = QFontMetrics(small)
+        if not allbars:
+            p.setPen(QColor(T["ink2"]))
+            p.drawText(self.rect(), Qt.AlignCenter, self.empty_text)
+            return
+        start, count = self._window(len(allbars))
+        bars = allbars[start:start + count]
+        candles = [b["c"] for b in bars]
+        last = allbars[-1]["snap"]
+        lv, pa = last["levels"], last.get("pa") or {}
+        levels = []
+        if self.show["oi"]:
+            levels += [(lv.get("R"), "Max call OI", T["dn"], Qt.DashLine), (lv.get("S"), "Max put OI", T["up"], Qt.DashLine)]
+        if self.show["fresh"]:
+            if lv.get("CE_fresh_near") not in (lv.get("R"),):
+                levels.append((lv.get("CE_fresh_near"), "Fresh calls", T["dn"], Qt.DotLine))
+            if lv.get("PE_fresh_near") not in (lv.get("S"),):
+                levels.append((lv.get("PE_fresh_near"), "Fresh puts", T["up"], Qt.DotLine))
+        if self.show["or"] and pa.get("or_high"):
+            levels += [(pa["or_high"], "OR high", T["ink2"], Qt.DashLine), (pa["or_low"], "OR low", T["ink2"], Qt.DashLine)]
+
+        sel = self.selected_signal()
+        sel_bar = self._bar_of(allbars, self.sel_key) if sel else None
+        plan = plan_levels(sel) if sel else None
+
+        lo, hi = min(c["low"] for c in candles), max(c["high"] for c in candles)
+        span = hi - lo
+        for v, *_ in levels:
+            if v and lo - 0.35 * span - 30 <= v <= hi + 0.35 * span + 30:
+                lo, hi = min(lo, v), max(hi, v)
+        if plan:
+            lo, hi = min([lo] + list(plan[:3])), max([hi] + list(plan[:3]))
+        pad = max(15, (hi - lo) * 0.08)
+        lo, hi = lo - pad, hi + pad
+        W, H = self.width(), self.height()
+        L, R, Tm, B = 62, 128, 14, 28
+        slots = count if self.zoomed() else max(count, 75 * 5 // self.tf)
+        cw = (W - L - R) / slots
+        self._geom = (L, cw, start, count, slots, W, R)
+        y = lambda v: Tm + (hi - v) / (hi - lo) * (H - Tm - B)
+        xof = lambda i: L + (i - start + 0.5) * cw       # i = index into allbars
+
+        # grid + price axis
+        step = 10 ** math.floor(math.log10(max(1, (hi - lo) / 5)))
+        step *= 5 if (hi - lo) / step > 25 else 2 if (hi - lo) / step > 10 else 1
+        g = math.ceil(lo / step) * step
+        while g <= hi:
+            p.setPen(QPen(QColor(T["grid"]), 1))
+            p.drawLine(QPointF(L, y(g)), QPointF(W - R, y(g)))
+            p.setPen(QColor(T["ink2"]))
+            p.drawText(QRectF(0, y(g) - 8, L - 8, 16), Qt.AlignRight | Qt.AlignVCenter, f"{g:,.0f}")
+            g += step
+
+        # selected signal: column highlight + entry / stop / target zones to the right of it
+        used = []
+
+        def right_label(v, text, col, bold=False):
+            ty = y(v)
+            while any(abs(ty - u) < 13 for u in used):
+                ty += 13
+            used.append(ty)
+            f2 = QFont(small)
+            f2.setBold(bold)
+            p.setFont(f2)
+            p.setPen(QColor(col))
+            p.drawText(QRectF(W - R + 6, ty - 8, R - 6, 16), Qt.AlignLeft | Qt.AlignVCenter, text)
+            p.setFont(small)
+
+        if sel_bar is not None and start <= sel_bar < start + count:
+            band = QColor(T["accent"])
+            band.setAlphaF(0.10)
+            p.fillRect(QRectF(xof(sel_bar) - cw / 2, Tm, cw, H - Tm - B), band)
+        if plan:
+            entry, stop, target, taken = plan
+            x0 = max(L, xof(sel_bar) if sel_bar is not None else L)
+            for a, b, col in ((entry, target, T["up"] if target > entry else T["dn"]),
+                              (entry, stop, T["dn"] if target > entry else T["up"])):
+                fill = QColor(col)
+                fill.setAlphaF(0.09 if taken else 0.05)
+                p.fillRect(QRectF(x0, min(y(a), y(b)), W - R - x0, abs(y(a) - y(b))), fill)
+            for v, name, col, style in ((target, "Target", T["up"] if target > entry else T["dn"], Qt.SolidLine),
+                                        (stop, "Stop", T["dn"] if target > entry else T["up"], Qt.SolidLine),
+                                        (entry, "Entry", T["accent"], Qt.SolidLine)):
+                p.setPen(QPen(QColor(col), 1.6, style if taken else Qt.DashDotLine))
+                p.drawLine(QPointF(x0, y(v)), QPointF(W - R, y(v)))
+                right_label(v, f"{name} {v:,.0f}", col, bold=True)
+
+        # OI / opening-range levels, labels on the right without overlapping
+        for v, name, col, style in levels:
+            if not v:
+                continue
+            if not (lo < v < hi):            # off-scale level: small label at the edge it lies beyond
+                ty = Tm + 8 if v > hi else H - B - 8
+                while any(abs(ty - u) < 13 for u in used):
+                    ty += 13 if v > hi else -13
+                used.append(ty)
+                p.setPen(QColor(col))
+                p.drawText(QRectF(W - R + 6, ty - 8, R - 6, 16), Qt.AlignLeft | Qt.AlignVCenter,
+                           f"{'↑' if v > hi else '↓'} {name} {v:,.0f}")
+                continue
+            p.setPen(QPen(QColor(col), 1.2, style))
+            p.drawLine(QPointF(L, y(v)), QPointF(W - R, y(v)))
+            right_label(v, f"{name} {v:,.0f}", col)
+
+        # candles + time axis (label spacing adapts to zoom)
+        interval = next((m for m in (5, 15, 30, 60, 120) if m >= self.tf and m / self.tf * cw >= 56), 120)
+        for k, c in enumerate(candles):
+            x = L + (k + 0.5) * cw
+            col = QColor(T["up"] if c["close"] >= c["open"] else T["dn"])
+            p.setPen(QPen(col, 1.2))
+            p.drawLine(QPointF(x, y(c["high"])), QPointF(x, y(c["low"])))
+            top, bot = y(max(c["open"], c["close"])), y(min(c["open"], c["close"]))
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(x - cw * 0.34, top, cw * 0.68, max(1.2, bot - top)), 1, 1)
+            mins = c["start"].hour * 60 + c["start"].minute
+            if (mins - 555) % interval == 0 if interval < 60 else mins % interval == 0 or mins == 555:
+                p.setPen(QColor(T["ink2"]))
+                p.drawText(QRectF(x - 30, H - B + 6, 60, 16), Qt.AlignCenter, f"{c['start']:%H:%M}")
+
+        # trade exit marker for the selected idea
+        if plan and sel and sel.get("result") and sel["result"].get("exit_time"):
+            r = sel["result"]
+            ex = next((i for i, b in enumerate(allbars) if any(s["time"] == r["exit_time"] for s in b["snaps"])), None)
+            if ex is not None and start <= ex < start + count:
+                bull = plan[2] > plan[0]
+                px = plan[0] + (r["points"] if bull else -r["points"])
+                col = QColor(T["up"] if r["points"] > 0 else T["dn"] if r["points"] < 0 else T["ink2"])
+                p.setPen(QPen(col, 2))
+                p.setBrush(QColor(T["card"]))
+                p.drawEllipse(QPointF(xof(ex), y(px)), 5, 5)
+                p.drawText(QRectF(xof(ex) + 8, y(px) - 18, 120, 16), Qt.AlignLeft | Qt.AlignVCenter,
+                           f"{r['status']} {r['points']:+,.0f}")
+
+        # signal markers (with grade for trade ideas); remembered for clicking
+        marks = {}
+        for i in range(start, start + count):
+            for s in allbars[i]["snaps"]:
+                for sig in s.get("_signals", []):
+                    if sig["kind"] in self.MARKED:
+                        marks.setdefault(i, []).append(sig)
+        if self.show["marks"]:
+            for i, sigs in marks.items():
+                c = allbars[i]["c"]
+                x = xof(i)
+                for k, sig in enumerate(sigs[:2]):
+                    up = sig["direction"] == "bullish"
+                    col = QColor(T["up"] if up else T["dn"])
+                    cy = y(c["low"]) + 10 + k * 13 if up else y(c["high"]) - 10 - k * 13
+                    path = QPainterPath()
+                    if up:
+                        path.moveTo(x, cy - 5); path.lineTo(x - 5, cy + 4); path.lineTo(x + 5, cy + 4)
+                    else:
+                        path.moveTo(x, cy + 5); path.lineTo(x - 5, cy - 4); path.lineTo(x + 5, cy - 4)
+                    path.closeSubpath()
+                    if sig_key(sig) == self.sel_key:
+                        p.setPen(QPen(QColor(T["accent"]), 2))
+                        p.setBrush(Qt.NoBrush)
+                        p.drawEllipse(QPointF(x, cy), 9, 9)
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(col if sig.get("plan") else QColor(T["card"]))
+                    if not sig.get("plan"):
+                        p.setPen(QPen(col, 1.4))
+                    p.drawPath(path)
+                    if sig.get("plan") and sig.get("grade"):
+                        p.setPen(col)
+                        p.drawText(QRectF(x + 6, cy - 8, 14, 16), Qt.AlignLeft | Qt.AlignVCenter, sig["grade"])
+                    self._hits.append((QRectF(x - 8, cy - 8, 16, 16), sig))
+
+        # zoom hint
+        if self.zoomed():
+            txt = f"{count} of {len(allbars)} candles · double-click to reset"
+            p.setPen(QColor(T["ink2"]))
+            p.drawText(QRectF(L, 0, W - L - R, Tm + 2), Qt.AlignRight | Qt.AlignVCenter, txt)
+
+        # hover crosshair + tooltip
+        if self.hover is not None and self._press is None and L <= self.hover.x() <= W - R:
+            i = start + int((self.hover.x() - L) / cw)
+            if start <= i < start + count:
+                b = allbars[i]
+                c, s = b["c"], b["snap"]
+                x = xof(i)
+                p.setPen(QPen(QColor(T["ink2"]), 1, Qt.DotLine))
+                p.drawLine(QPointF(x, Tm), QPointF(x, H - B))
+                hy = max(Tm, min(H - B, self.hover.y()))
+                p.drawLine(QPointF(L, hy), QPointF(W - R, hy))
+                price = hi - (hy - Tm) / (H - Tm - B) * (hi - lo)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(T["ink"]))
+                p.drawRoundedRect(QRectF(2, hy - 9, L - 6, 18), 4, 4)
+                p.setPen(QColor(T["card"]))
+                p.drawText(QRectF(2, hy - 9, L - 6, 18), Qt.AlignCenter, f"{price:,.0f}")
+                first = b["snaps"][0]
+                d_oi = ""
+                prev_i = self.snaps.index(first) - 1 if first in self.snaps else -1
+                if prev_i >= 0 and s.get("strikes") and self.snaps[prev_i].get("strikes"):
+                    a, z = self.snaps[prev_i]["strikes"], s["strikes"]
+                    dce = sum(z[k]["ce_oi"] - a[k]["ce_oi"] for k in z if k in a)
+                    dpe = sum(z[k]["pe_oi"] - a[k]["pe_oi"] for k in z if k in a)
+                    d_oi = f"OI chg  calls {dce:+,.0f}  puts {dpe:+,.0f}"
+                lines = [f"{c['start']:%H:%M}–{c['start'] + dt.timedelta(minutes=b['dur']):%H:%M}",
+                         f"O {c['open']:,.2f}   H {c['high']:,.2f}",
+                         f"L {c['low']:,.2f}   C {c['close']:,.2f}",
+                         f"PCR {s['pcr']:.2f}" if s.get("pcr") else "PCR –"]
+                if d_oi:
+                    lines.append(d_oi)
+                others = [g for x2 in b["snaps"] for g in x2.get("_signals", []) if g["kind"] not in self.MARKED]
+                for sig in marks.get(i, []) + others[:3]:
+                    lines.append(f"{sig['kind']}" + (f"  · grade {sig['grade']}" if sig.get("plan") else ""))
+                if marks.get(i):
+                    lines.append("click to show entry / stop / target")
+                bw = max(fm.horizontalAdvance(t) for t in lines) + 20
+                bh = len(lines) * 16 + 12
+                bx = x + 12 if x + 12 + bw < W - R else x - 12 - bw
+                by = max(Tm, min(H - B - bh, hy - bh / 2))
+                p.setPen(QPen(QColor(T["line"]), 1))
+                p.setBrush(QColor(T["tip"]))
+                p.drawRoundedRect(QRectF(bx, by, bw, bh), 8, 8)
+                for k, t in enumerate(lines):
+                    p.setPen(QColor(T["ink"] if 0 < k < len(lines) - (1 if marks.get(i) else 0) else T["ink2"]))
+                    p.drawText(QRectF(bx + 10, by + 6 + k * 16, bw - 16, 16), Qt.AlignLeft | Qt.AlignVCenter, t)
+        p.end()
+
+
+# --------------------------------------------------------------------------- small line chart (history pop-ups)
+class LineChart(QWidget):
+    """Lines over the day with a hover read-out. series = [(name, colour, [(datetime, value), ...]), ...]"""
+
+    def __init__(self, series, fmt="{:,.0f}"):
+        super().__init__()
+        self.series, self.fmt, self.hover = series, fmt, None
+        self.setMouseTracking(True)
+        self.setMinimumSize(520, 260)
 
     def leaveEvent(self, e):
         self.hover = None
@@ -339,153 +833,114 @@ class ChartWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.rect(), QColor(T["card"]))
-        snaps = [s for s in self.snaps if s.get("candle")]
         small = QFont(self.font())
         small.setPointSizeF(8.5)
         p.setFont(small)
         fm = QFontMetrics(small)
-        if not snaps:
+        pts = [v for _, _, ser in self.series for _, v in ser if v is not None]
+        times = sorted({t for _, _, ser in self.series for t, _ in ser})
+        if len(times) < 2 or not pts:
             p.setPen(QColor(T["ink2"]))
-            p.drawText(self.rect(), Qt.AlignCenter, self.empty_text)
+            p.drawText(self.rect(), Qt.AlignCenter, "Not enough data yet.")
             return
-        candles = [s["candle"] for s in snaps]
-        last = snaps[-1]
-        lv, pa = last["levels"], last.get("pa") or {}
-        levels = [(lv.get("R"), "Max call OI", T["dn"], Qt.DashLine), (lv.get("S"), "Max put OI", T["up"], Qt.DashLine)]
-        if lv.get("CE_fresh_near") not in (lv.get("R"),):
-            levels.append((lv.get("CE_fresh_near"), "Fresh calls", T["dn"], Qt.DotLine))
-        if lv.get("PE_fresh_near") not in (lv.get("S"),):
-            levels.append((lv.get("PE_fresh_near"), "Fresh puts", T["up"], Qt.DotLine))
-        if pa.get("or_high"):
-            levels += [(pa["or_high"], "OR high", T["ink2"], Qt.DashLine), (pa["or_low"], "OR low", T["ink2"], Qt.DashLine)]
-        lo, hi = min(c["low"] for c in candles), max(c["high"] for c in candles)
-        span = hi - lo
-        for v, *_ in levels:
-            if v and lo - 0.35 * span - 30 <= v <= hi + 0.35 * span + 30:
-                lo, hi = min(lo, v), max(hi, v)
-        pad = max(15, (hi - lo) * 0.08)
+        lo, hi = min(pts), max(pts)
+        pad = (hi - lo) * 0.1 or max(1, abs(hi) * 0.01)
         lo, hi = lo - pad, hi + pad
         W, H = self.width(), self.height()
-        L, R, Tm, B = 62, 128, 14, 28
-        n = max(len(candles), 75)
-        cw = (W - L - R) / n
+        L, R, Tm, B = 70, 16, 30, 26
+        tx = {t: L + i / (len(times) - 1) * (W - L - R) for i, t in enumerate(times)}
         y = lambda v: Tm + (hi - v) / (hi - lo) * (H - Tm - B)
-
-        # grid + price axis
-        step = 10 ** math.floor(math.log10(max(1, (hi - lo) / 5)))
-        step *= 5 if (hi - lo) / step > 25 else 2 if (hi - lo) / step > 10 else 1
-        g = math.ceil(lo / step) * step
-        while g <= hi:
+        for k in range(5):
+            v = lo + (hi - lo) * k / 4
             p.setPen(QPen(QColor(T["grid"]), 1))
-            p.drawLine(QPointF(L, y(g)), QPointF(W - R, y(g)))
-            p.setPen(QColor(T["ink2"]))
-            p.drawText(QRectF(0, y(g) - 8, L - 8, 16), Qt.AlignRight | Qt.AlignVCenter, f"{g:,.0f}")
-            g += step
-
-        # OI / opening-range levels, labels on the right without overlapping
-        used = []
-        for v, name, col, style in levels:
-            if not v:
-                continue
-            if not (lo < v < hi):            # off-scale level: small label at the edge it lies beyond
-                ty = Tm + 8 if v > hi else H - B - 8
-                while any(abs(ty - u) < 13 for u in used):
-                    ty += 13 if v > hi else -13
-                used.append(ty)
-                p.setPen(QColor(col))
-                p.drawText(QRectF(W - R + 6, ty - 8, R - 6, 16), Qt.AlignLeft | Qt.AlignVCenter,
-                           f"{'↑' if v > hi else '↓'} {name} {v:,.0f}")
-                continue
-            pen = QPen(QColor(col), 1.2, style)
-            p.setPen(pen)
             p.drawLine(QPointF(L, y(v)), QPointF(W - R, y(v)))
-            ty = y(v)
-            while any(abs(ty - u) < 13 for u in used):
-                ty += 13
-            used.append(ty)
-            p.setPen(QColor(col))
-            p.drawText(QRectF(W - R + 6, ty - 8, R - 6, 16), Qt.AlignLeft | Qt.AlignVCenter, f"{name} {v:,.0f}")
-
-        # candles
-        for i, c in enumerate(candles):
-            x = L + (i + 0.5) * cw
-            col = QColor(T["up"] if c["close"] >= c["open"] else T["dn"])
-            p.setPen(QPen(col, 1.2))
-            p.drawLine(QPointF(x, y(c["high"])), QPointF(x, y(c["low"])))
-            top, bot = y(max(c["open"], c["close"])), y(min(c["open"], c["close"]))
-            p.setPen(Qt.NoPen)
-            p.setBrush(col)
-            p.drawRoundedRect(QRectF(x - cw * 0.34, top, cw * 0.68, max(1.2, bot - top)), 1, 1)
-            if (c["start"].hour, c["start"].minute) == (9, 15) or (c["start"].minute == 0 and c["start"].hour > 9):
-                p.setPen(QColor(T["ink2"]))
-                p.drawText(QRectF(x - 30, H - B + 6, 60, 16), Qt.AlignCenter, f"{c['start']:%H:%M}")
-
-        # signal markers (with grade for trade ideas)
-        idx = {s["time"]: i for i, s in enumerate(snaps)}
-        marks = {}
-        for s in snaps:
-            for sig in s.get("_signals", []):
-                if sig["kind"] in self.MARKED and sig["time"] in idx:
-                    marks.setdefault(idx[sig["time"]], []).append(sig)
-        for i, sigs in marks.items():
-            c = candles[i]
-            x = L + (i + 0.5) * cw
-            for k, sig in enumerate(sigs[:2]):
-                up = sig["direction"] == "bullish"
-                col = QColor(T["up"] if up else T["dn"])
-                cy = y(c["low"]) + 10 + k * 13 if up else y(c["high"]) - 10 - k * 13
-                path = QPainterPath()
-                if up:
-                    path.moveTo(x, cy - 5); path.lineTo(x - 5, cy + 4); path.lineTo(x + 5, cy + 4)
-                else:
-                    path.moveTo(x, cy + 5); path.lineTo(x - 5, cy - 4); path.lineTo(x + 5, cy - 4)
-                path.closeSubpath()
-                p.setPen(Qt.NoPen)
-                p.setBrush(col if sig.get("plan") else QColor(T["card"]))
-                if not sig.get("plan"):
-                    p.setPen(QPen(col, 1.4))
-                p.drawPath(path)
-                if sig.get("plan") and sig.get("grade"):
-                    p.setPen(col)
-                    p.drawText(QRectF(x + 6, cy - 8, 14, 16), Qt.AlignLeft | Qt.AlignVCenter, sig["grade"])
-
-        # hover crosshair + tooltip
+            p.setPen(QColor(T["ink2"]))
+            p.drawText(QRectF(0, y(v) - 8, L - 8, 16), Qt.AlignRight | Qt.AlignVCenter, self.fmt.format(v))
+        every = max(1, int(len(times) / max(1, (W - L - R) / 70)))
+        for i, t in enumerate(times):
+            if i % every == 0:
+                p.drawText(QRectF(tx[t] - 30, H - B + 6, 60, 16), Qt.AlignCenter, f"{t:%H:%M}")
+        lx = L
+        for name, col, ser in self.series:          # legend
+            p.setPen(QPen(QColor(col), 3))
+            p.drawLine(QPointF(lx, 12), QPointF(lx + 16, 12))
+            p.setPen(QColor(T["ink"]))
+            p.drawText(QRectF(lx + 22, 4, 200, 16), Qt.AlignLeft | Qt.AlignVCenter, name)
+            lx += 40 + fm.horizontalAdvance(name)
+        for name, col, ser in self.series:
+            path = QPainterPath()
+            first = True
+            for t, v in ser:
+                if v is None:
+                    continue
+                pt = QPointF(tx[t], y(v))
+                path.moveTo(pt) if first else path.lineTo(pt)
+                first = False
+            p.setPen(QPen(QColor(col), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
         if self.hover is not None and L <= self.hover.x() <= W - R:
-            i = int((self.hover.x() - L) / cw)
-            if 0 <= i < len(candles):
-                c, s = candles[i], snaps[i]
-                x = L + (i + 0.5) * cw
-                p.setPen(QPen(QColor(T["ink2"]), 1, Qt.DotLine))
-                p.drawLine(QPointF(x, Tm), QPointF(x, H - B))
-                hy = max(Tm, min(H - B, self.hover.y()))
-                p.drawLine(QPointF(L, hy), QPointF(W - R, hy))
-                price = hi - (hy - Tm) / (H - Tm - B) * (hi - lo)
-                p.setPen(Qt.NoPen)
-                p.setBrush(QColor(T["ink"]))
-                p.drawRoundedRect(QRectF(2, hy - 9, L - 6, 18), 4, 4)
-                p.setPen(QColor(T["card"]))
-                p.drawText(QRectF(2, hy - 9, L - 6, 18), Qt.AlignCenter, f"{price:,.0f}")
-                lines = [f"{c['start']:%H:%M}–{c['start'] + dt.timedelta(minutes=5):%H:%M}",
-                         f"O {c['open']:,.2f}   H {c['high']:,.2f}",
-                         f"L {c['low']:,.2f}   C {c['close']:,.2f}",
-                         f"PCR {s['pcr']:.2f}" if s.get("pcr") else "PCR –"]
-                for sig in marks.get(i, []) + [x2 for x2 in s.get("_signals", []) if x2["kind"] not in self.MARKED][:3]:
-                    lines.append(f"{sig['kind']}" + (f"  · grade {sig['grade']}" if sig.get("plan") else ""))
-                bw = max(fm.horizontalAdvance(t) for t in lines) + 20
-                bh = len(lines) * 16 + 12
-                bx = x + 12 if x + 12 + bw < W - R else x - 12 - bw
-                by = max(Tm, min(H - B - bh, hy - bh / 2))
-                p.setPen(QPen(QColor(T["line"]), 1))
-                p.setBrush(QColor(T["tip"]))
-                p.drawRoundedRect(QRectF(bx, by, bw, bh), 8, 8)
-                for k, t in enumerate(lines):
-                    p.setPen(QColor(T["ink"] if k else T["ink2"]))
-                    p.drawText(QRectF(bx + 10, by + 6 + k * 16, bw - 16, 16), Qt.AlignLeft | Qt.AlignVCenter, t)
+            t = min(times, key=lambda t: abs(tx[t] - self.hover.x()))
+            p.setPen(QPen(QColor(T["ink2"]), 1, Qt.DotLine))
+            p.drawLine(QPointF(tx[t], Tm), QPointF(tx[t], H - B))
+            lines = [f"{t:%H:%M}"]
+            for name, col, ser in self.series:
+                v = dict(ser).get(t)
+                if v is not None:
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(QColor(col))
+                    p.drawEllipse(QPointF(tx[t], y(v)), 4, 4)
+                    lines.append(f"{name}  {self.fmt.format(v)}")
+            bw = max(fm.horizontalAdvance(s) for s in lines) + 20
+            bh = len(lines) * 16 + 12
+            bx = tx[t] + 12 if tx[t] + 12 + bw < W - R else tx[t] - 12 - bw
+            p.setPen(QPen(QColor(T["line"]), 1))
+            p.setBrush(QColor(T["tip"]))
+            p.drawRoundedRect(QRectF(bx, Tm, bw, bh), 8, 8)
+            for k, s in enumerate(lines):
+                p.setPen(QColor(T["ink2"] if k == 0 else T["ink"]))
+                p.drawText(QRectF(bx + 10, Tm + 6 + k * 16, bw - 16, 16), Qt.AlignLeft | Qt.AlignVCenter, s)
         p.end()
 
 
+class HistoryDialog(QDialog):
+    def __init__(self, parent, title, series, fmt="{:,.0f}", note=""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(780, 420)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        head = QLabel(title)
+        head.setStyleSheet("font-size:12pt; font-weight:650;")
+        v.addWidget(head)
+        v.addWidget(LineChart(series, fmt), 1)
+        if note:
+            n = QLabel(note)
+            n.setObjectName("ts")
+            n.setWordWrap(True)
+            v.addWidget(n)
+
+
 # --------------------------------------------------------------------------- signal feed
+class SignalCard(QFrame):
+    clicked = Signal(object)
+
+    def __init__(self, sig):
+        super().__init__()
+        self.sig = sig
+        self.setObjectName("card")
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self.sig)
+
+
 class SignalFeed(QWidget):
+    selected = Signal(object)            # signal dict or None
+    FILTERS = ["All signals", "Trade ideas only", "Graded A/B only", "Bullish only", "Bearish only"]
+    NEW_SECONDS = 120
+
     def __init__(self):
         super().__init__()
         lay = QVBoxLayout(self)
@@ -497,27 +952,59 @@ class SignalFeed(QWidget):
         self.count = QLabel("")
         self.count.setObjectName("muted")
         self.filter = QComboBox()
-        self.filter.addItems(["All signals", "Trade ideas only", "Graded A/B only"])
+        self.filter.addItems(self.FILTERS)
         self.filter.currentIndexChanged.connect(lambda _: self.render())
         head.addWidget(t)
         head.addWidget(self.count)
         head.addStretch()
         head.addWidget(self.filter)
         lay.addLayout(head)
+        hint = QLabel("Click a card to see it on the chart · Ctrl+↑/↓ steps through them")
+        hint.setObjectName("ts")
+        lay.addWidget(hint)
         self.area = QScrollArea()
         self.area.setWidgetResizable(True)
         self.inner = QWidget()
         self.vbox = QVBoxLayout(self.inner)
-        self.vbox.setContentsMargins(0, 0, 6, 0)
-        self.vbox.setSpacing(8)
-        self.vbox.addStretch()
         self.area.setWidget(self.inner)
         lay.addWidget(self.area, 1)
-        self.signals = []
+        self.signals, self.cards, self.sel_key, self.new_at = [], {}, None, {}
+        self.new_timer = QTimer(self)
+        self.new_timer.setSingleShot(True)
+        self.new_timer.timeout.connect(self.render)
 
     def set_signals(self, signals):
         self.signals = signals
         self.render()
+
+    def mark_new(self, sigs):
+        now = time.monotonic()
+        for s in sigs:
+            self.new_at[sig_key(s)] = now
+        self.new_timer.start(self.NEW_SECONDS * 1000 + 500)
+
+    def visible(self):
+        f = self.filter.currentIndex()
+        keep = [lambda s: True, lambda s: s.get("plan"), lambda s: s.get("plan") and s.get("grade") in ("A", "B"),
+                lambda s: s["direction"] == "bullish", lambda s: s["direction"] == "bearish"][f]
+        return [s for s in self.signals if keep(s)]
+
+    def set_selected(self, key, scroll=True):
+        self.sel_key = key
+        for k, fr in self.cards.items():
+            self.style_card(fr, k == key)
+        if scroll and key in self.cards:
+            fr = self.cards[key]
+            QTimer.singleShot(0, lambda: self.area.ensureWidgetVisible(fr, 0, 40))
+
+    def style_card(self, fr, on):
+        col = dir_color(fr.sig["direction"])
+        if on:
+            fr.setStyleSheet(f"QFrame#card {{ border:2px solid {T['accent']}; border-left:5px solid {col};"
+                             f" background:{T['atm']}; }}")
+        else:
+            fr.setStyleSheet(f"QFrame#card {{ border-left:4px solid {col}; }}"
+                             f" QFrame#card:hover {{ background:{T['hover']}; }}")
 
     def render(self):
         pos = self.area.verticalScrollBar().value()
@@ -527,10 +1014,9 @@ class SignalFeed(QWidget):
         self.vbox.setSpacing(8)
         self.vbox.addStretch()
         self.area.setWidget(self.inner)                 # the old one is deleted by Qt
+        self.cards = {}
         QTimer.singleShot(0, lambda: self.area.verticalScrollBar().setValue(pos))
-        f = self.filter.currentIndex()
-        sigs = [s for s in self.signals if f == 0 or (s.get("plan") if f == 1 else
-                                                      (s.get("plan") and s.get("grade") in ("A", "B")))]
+        sigs = self.visible()
         self.count.setText(f"{len(sigs)}" + (f" of {len(self.signals)}" if len(sigs) != len(self.signals) else ""))
         if not sigs:
             lab = QLabel("No signals yet." if not self.signals else "Nothing matches this filter.")
@@ -543,10 +1029,12 @@ class SignalFeed(QWidget):
             self.vbox.insertWidget(i, self.card(s))
 
     def card(self, s):
-        fr = QFrame()
-        fr.setObjectName("card")
+        key = sig_key(s)
+        fr = SignalCard(s)
+        fr.clicked.connect(lambda sig: self.selected.emit(None if sig_key(sig) == self.sel_key else sig))
+        self.cards[key] = fr
+        self.style_card(fr, key == self.sel_key)
         col = dir_color(s["direction"])
-        fr.setStyleSheet(f"QFrame#card {{ border-left:4px solid {col}; }}")
         lay = QVBoxLayout(fr)
         lay.setContentsMargins(12, 9, 12, 10)
         lay.setSpacing(4)
@@ -555,9 +1043,13 @@ class SignalFeed(QWidget):
             gcol = {"A": T["up"], "B": T["accent"], "C": T["ink2"]}[s["grade"]]
             badge = (f"&nbsp;&nbsp;<span style='color:{gcol}; font-weight:700;'>Grade {s['grade']}"
                      + (f" · {s['score']}" if s.get("score") is not None else "") + "</span>")
+        new = ""
+        if time.monotonic() - self.new_at.get(key, -1e9) < self.NEW_SECONDS:
+            new = (f"&nbsp;&nbsp;<span style='background:{T['accent']}; color:{T['accent_ink']};"
+                   f" font-weight:700;'>&nbsp;NEW&nbsp;</span>")
         head = QLabel(f"<span style='color:{T['ink2']};'>{s['time']:%H:%M}</span>&nbsp;&nbsp;"
                       f"<b style='color:{col};'>{esc(s['kind'])}</b>{badge}"
-                      f"<span style='color:{T['ink2']};'>&nbsp;&nbsp;@ {s['price']:,.2f}</span>")
+                      f"<span style='color:{T['ink2']};'>&nbsp;&nbsp;@ {s['price']:,.2f}</span>{new}")
         lay.addWidget(head)
         det = QLabel(esc(s["text"]))
         det.setWordWrap(True)
@@ -584,6 +1076,8 @@ class SignalFeed(QWidget):
         note.setWordWrap(True)
         note.setObjectName("ts")
         lay.addWidget(note)
+        for w in fr.findChildren(QLabel):               # let clicks on the text reach the card
+            w.setAttribute(Qt.WA_TransparentForMouseEvents)
         return fr
 
 
@@ -701,6 +1195,7 @@ class MainWindow(QMainWindow):
         self.worker, self.rec, self.next_wait = None, None, None
         self.running_mode, self.had_error = "", False
         self.snaps, self.signals = [], []
+        self.sel_key, self.chain_strikes, self.trade_rows = None, [], []
         self.setWindowTitle(APP_NAME)
         self.resize(1360, 860)
         self.setMinimumSize(1080, 680)
@@ -712,6 +1207,7 @@ class MainWindow(QMainWindow):
             self.tray.activated.connect(lambda *_: (self.showNormal(), self.activateWindow()))
             self.tray.show()
         self.build()
+        self.build_shortcuts()
         self.apply_theme()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -762,6 +1258,7 @@ class MainWindow(QMainWindow):
         self.start_btn = QPushButton("Start")
         self.start_btn.setObjectName("primary")
         self.start_btn.clicked.connect(self.toggle)
+        self.start_btn.setToolTip("Start / stop (F5)")
         h.addWidget(self.mode)
         h.addWidget(self.expiry)
         h.addWidget(self.start_btn)
@@ -774,6 +1271,13 @@ class MainWindow(QMainWindow):
             b.clicked.connect(fn)
             h.addWidget(b)
         v.addWidget(header)
+        self.countdown = QProgressBar()
+        self.countdown.setObjectName("countdown")
+        self.countdown.setTextVisible(False)
+        self.countdown.setRange(0, 1000)
+        self.countdown.setFixedHeight(3)
+        self.countdown.setValue(0)
+        v.addWidget(self.countdown)
 
         body = QWidget()
         bv = QVBoxLayout(body)
@@ -786,7 +1290,8 @@ class MainWindow(QMainWindow):
                                           ("res", "Resistance · max call OI"), ("sup", "Support · max put OI"),
                                           ("mp", "Max pain"), ("vix", "India VIX"), ("trend", "15-min trend"),
                                           ("pa", "Price action")]):
-            t = Tile(label)
+            t = Tile(label, spark=key != "pa")
+            t.clicked.connect(lambda k=key: self.show_tile_history(k))
             self.tiles[key] = t
             tiles.addWidget(t, 0, i)
         bv.addLayout(tiles)
@@ -799,9 +1304,37 @@ class MainWindow(QMainWindow):
         cw.setObjectName("page")
         cl = QVBoxLayout(cw)
         cl.setContentsMargins(8, 8, 8, 8)
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        for name, text, tip in (("oi", "OI levels", "Max call / put OI lines"),
+                                ("fresh", "Fresh OI", "Strikes with the biggest fresh writing"),
+                                ("or", "Opening range", "First 15-minute high and low"),
+                                ("marks", "Signals", "Signal markers on the candles")):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setCheckable(True)
+            b.setChecked(True)
+            b.toggled.connect(lambda on, n=name: self.chart.toggle(n, on))
+            bar.addWidget(b)
+        bar.addSpacing(8)
+        self.tf = QComboBox()
+        self.tf.addItems(["5 min", "15 min"])
+        self.tf.setToolTip("Candle size")
+        self.tf.currentIndexChanged.connect(lambda i: self.chart.set_timeframe(5 if i == 0 else 15))
+        bar.addWidget(self.tf)
+        self.reset_zoom = QToolButton()
+        self.reset_zoom.setText("Reset zoom")
+        self.reset_zoom.setToolTip("Show the whole day (Ctrl+0, or double-click the chart)")
+        self.reset_zoom.clicked.connect(self.chart.reset_view)
+        self.reset_zoom.setEnabled(False)
+        self.chart.view_changed.connect(lambda: self.reset_zoom.setEnabled(self.chart.zoomed()))
+        bar.addWidget(self.reset_zoom)
+        bar.addStretch()
+        cl.addLayout(bar)
         cl.addWidget(self.chart, 1)
-        legend = QLabel(f"▲▼ filled = trade idea (letter = grade) · hollow = information only · "
-                        f"dashed = OI levels and opening range · hover for details")
+        legend = QLabel("▲▼ filled = trade idea (letter = grade) · hollow = information only · "
+                        "scroll = zoom · drag = pan · click a marker = entry / stop / target")
         legend.setObjectName("ts")
         cl.addWidget(legend)
         self.tabs.addTab(cw, "Chart")
@@ -810,7 +1343,9 @@ class MainWindow(QMainWindow):
                                               "Put 5-min", "Put day chg"])
         self.chain.verticalHeader().hide()
         self.chain.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.chain.setSelectionMode(QAbstractItemView.NoSelection)
+        self.chain.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.chain.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.chain.cellDoubleClicked.connect(self.show_strike_history)
         self.chain.setShowGrid(False)
         self.chain.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.chain.verticalHeader().setDefaultSectionSize(30)
@@ -824,6 +1359,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.log, "Log")
         split.addWidget(self.tabs)
         self.feed = SignalFeed()
+        self.feed.selected.connect(lambda sig: self.select_signal(sig, scroll_feed=False))
+        self.chart.signal_clicked.connect(lambda sig: self.select_signal(sig, show_chart=False))
         split.addWidget(self.feed)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
@@ -848,7 +1385,7 @@ class MainWindow(QMainWindow):
         self.sc_tiles = {}
         for key, label in (("ideas", "Trade ideas"), ("won", "Won / closed"), ("pts", "Net Nifty points"),
                            ("opt", "Option P&L (Rs/unit)")):
-            t = Tile(label)
+            t = Tile(label, spark=False)
             self.sc_tiles[key] = t
             g.addWidget(t)
         v.addLayout(g)
@@ -861,6 +1398,7 @@ class MainWindow(QMainWindow):
         self.trades.verticalHeader().hide()
         self.trades.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.trades.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.trades.cellDoubleClicked.connect(self.on_trade_dblclick)
         self.trades.setShowGrid(False)
         hh = self.trades.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -910,6 +1448,7 @@ class MainWindow(QMainWindow):
         os.makedirs(self.settings["data_dir"], exist_ok=True)
         expiry = self.expiry.currentText() if self.expiry.currentIndex() > 0 else None
         self.snaps, self.signals, self.rec, self.next_wait = [], [], None, None
+        self.select_signal(None)
         self.chart.empty_text = "Connecting to NSE…" if mode != "retest" else "Loading…"
         self.refresh_all()
         self.worker = Worker(mode, self.settings["data_dir"], expiry, folder, self.settings["sound"])
@@ -1000,6 +1539,8 @@ class MainWindow(QMainWindow):
         self.snaps.append(snap)
         self.signals.extend(sigs)
         replaying = self.running_mode != "live" or snap.get("_restored")
+        if not replaying and sigs:
+            self.feed.mark_new(sigs)
         if not replaying or len(self.snaps) % 15 == 0:
             self.refresh_all()
         if replaying:
@@ -1036,6 +1577,7 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning() and self.running_mode == "live" and self.next_wait:
             now = dt.datetime.now(engine.IST)
             left = (self.next_wait + dt.timedelta(seconds=engine.POLL_DELAY_SEC) - now).total_seconds()
+            self.countdown.setValue(int(1000 * max(0.0, min(1.0, 1 - left / 300.0))))
             if left > 0:
                 m, s = divmod(int(left), 60)
                 h, m = divmod(m, 60)
@@ -1043,6 +1585,8 @@ class MainWindow(QMainWindow):
                 self.pill_set(f"Live · next update {self.next_wait:%H:%M} (in {eta})", T["up"])
             else:
                 self.pill_set("Live · fetching…", T["up"])
+        elif self.countdown.value():
+            self.countdown.setValue(0)
 
     def closeEvent(self, e):
         if self.worker and self.worker.isRunning():
@@ -1058,6 +1602,96 @@ class MainWindow(QMainWindow):
     def on_expiries(self, items):
         for x in items:
             self.expiry.addItem(x)
+
+    # ---- interaction
+    def build_shortcuts(self):
+        keys = [("F5", self.toggle), ("Esc", lambda: self.select_signal(None)),
+                ("Ctrl+Up", lambda: self.step_signal(-1)), ("Ctrl+Down", lambda: self.step_signal(1)),
+                ("Ctrl+0", self.chart.reset_view), ("Ctrl+=", lambda: self.chart.zoom(0.8, 1.0)),
+                ("Ctrl++", lambda: self.chart.zoom(0.8, 1.0)), ("Ctrl+-", lambda: self.chart.zoom(1.25, 1.0))]
+        keys += [(f"Ctrl+{i + 1}", lambda i=i: self.tabs.setCurrentIndex(i)) for i in range(self.tabs.count())]
+        for seq, fn in keys:
+            QShortcut(QKeySequence(seq), self, activated=fn)
+
+    def select_signal(self, sig, scroll_feed=True, show_chart=True):
+        """One selection shared by the chart, the feed and the status bar."""
+        self.sel_key = sig_key(sig) if sig else None
+        self.chart.set_selected(self.sel_key)
+        self.feed.set_selected(self.sel_key, scroll=scroll_feed)
+        if not sig:
+            self.statusBar().clearMessage()
+            return
+        if show_chart:
+            self.tabs.setCurrentIndex(0)
+        self.chart.center_on(self.sel_key)
+        lv = plan_levels(sig)
+        msg = f"{sig['time']:%H:%M} {sig['kind']} @ {sig['price']:,.2f}"
+        if lv:
+            entry, stop, target, taken = lv
+            rr = abs(target - entry) / max(0.01, abs(entry - stop))
+            msg += (f"   ·   entry {entry:,.0f}  stop {stop:,.0f}  target {target:,.0f}  (R:R {rr:.1f})"
+                    + ("" if taken else "  ·  skipped"))
+        self.statusBar().showMessage(msg + "   ·   Esc to clear")
+
+    def step_signal(self, d):
+        """Ctrl+Up / Ctrl+Down: previous / next signal shown in the feed (newest is at the top)."""
+        sigs = list(reversed(self.feed.visible()))
+        if not sigs:
+            return
+        keys = [sig_key(s) for s in sigs]
+        i = keys.index(self.sel_key) + d if self.sel_key in keys else 0
+        self.select_signal(sigs[max(0, min(len(sigs) - 1, i))])
+
+    TILE_HIST = {"nifty": ("Nifty 5-min close", "{:,.2f}", lambda s: s["candle"]["close"]),
+                 "pcr": ("Put-call ratio", "{:.2f}", lambda s: s.get("pcr")),
+                 "res": ("Resistance (max call OI strike)", "{:,.0f}", lambda s: s["levels"].get("R")),
+                 "sup": ("Support (max put OI strike)", "{:,.0f}", lambda s: s["levels"].get("S")),
+                 "mp": ("Max pain", "{:,.0f}", lambda s: s.get("max_pain")),
+                 "vix": ("India VIX", "{:.2f}", lambda s: s.get("vix")),
+                 "trend": ("15-min EMA9", "{:,.0f}", lambda s: (s.get("trend15") or {}).get("ema"))}
+
+    def tile_history(self, key):
+        if key not in self.TILE_HIST:
+            return []
+        fn = self.TILE_HIST[key][2]
+        out = []
+        for s in self.snaps:
+            if not s.get("candle"):
+                continue
+            try:
+                out.append((s["time"], fn(s)))
+            except (KeyError, TypeError):
+                out.append((s["time"], None))
+        return out
+
+    def show_tile_history(self, key):
+        hist = self.tile_history(key)
+        if len(hist) < 2:
+            return
+        title, fmt, _ = self.TILE_HIST[key]
+        series = [(title, T["accent"], hist)]
+        if key == "nifty":
+            series += [("Max call OI", T["dn"], self.tile_history("res")), ("Max put OI", T["up"], self.tile_history("sup"))]
+        self.open_dialog(HistoryDialog(self, f"{title} · today", series, fmt))
+
+    def show_strike_history(self, row, _col=0):
+        if not (0 <= row < len(self.chain_strikes)):
+            return
+        k = self.chain_strikes[row]
+        ce = [(s["time"], s["strikes"][k]["ce_oi"]) for s in self.snaps if k in s.get("strikes", {})]
+        pe = [(s["time"], s["strikes"][k]["pe_oi"]) for s in self.snaps if k in s.get("strikes", {})]
+        self.open_dialog(HistoryDialog(self, f"{k:,.0f} strike · call vs put OI today",
+                                       [("Call OI", T["dn"], ce), ("Put OI", T["up"], pe)],
+                                       note="Rising call OI = writers defending this strike from above; "
+                                            "rising put OI = support building. Hover the lines for exact values."))
+
+    def on_trade_dblclick(self, row, _col):
+        if 0 <= row < len(self.trade_rows):
+            self.select_signal(self.trade_rows[row])
+
+    def open_dialog(self, dlg):
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.show()
 
     # ---- rendering
     def refresh_all(self):
@@ -1075,6 +1709,8 @@ class MainWindow(QMainWindow):
         self.feed.set_signals(self.signals)
 
     def refresh_tiles(self):
+        for k, t in self.tiles.items():
+            t.set_history(self.tile_history(k))
         if not self.snaps:
             for t in self.tiles.values():
                 t.set("–", "")
@@ -1111,6 +1747,7 @@ class MainWindow(QMainWindow):
         st = last["strikes"]
         ks = [k for k in sorted(st) if abs(k - last["atm"]) <= 10 * engine.STRIKE_STEP]
         mx = max([st[k]["ce_oi"] for k in ks] + [st[k]["pe_oi"] for k in ks] + [1])
+        self.chain_strikes = ks
         self.chain.setRowCount(len(ks))
         atm_bg = QBrush(QColor(T["atm"]))
         for r, k in enumerate(ks):
@@ -1130,6 +1767,7 @@ class MainWindow(QMainWindow):
                     it.setData(Qt.UserRole, v["pe_oi"] / mx)
                     it.setData(Qt.UserRole + 1, "pe")
                 if col == 3:
+                    it.setToolTip("Double-click to see how this strike's call and put OI built up today")
                     f = it.font()
                     f.setBold(True)
                     it.setFont(f)
@@ -1147,6 +1785,7 @@ class MainWindow(QMainWindow):
     def refresh_scorecard(self):
         res = [s["result"] for s in self.signals if s.get("result")]
         self.trades.setRowCount(0)
+        self.trade_rows = []
         if not res:
             self.sc_tiles["ideas"].set("0", "no trade ideas yet")
             for k in ("won", "pts", "opt"):
@@ -1163,6 +1802,7 @@ class MainWindow(QMainWindow):
                                  T["up"] if sc["opt_pnl"] > 0 else T["dn"] if sc["opt_pnl"] < 0 else None)
         self.sc_grades.setText("   ·   ".join(f"Grade {g}: {n} trades, {w} won, {p:+,.0f} pts"
                                              for g, (n, w, p) in sc["by_grade"].items()))
+        self.trade_rows = [x["sig"] for x in reversed(res)]
         self.trades.setRowCount(len(res))
         for r, x in enumerate(reversed(res)):
             sg, p = x["sig"], x["sig"]["plan"]
