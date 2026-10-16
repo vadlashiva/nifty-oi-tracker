@@ -71,6 +71,7 @@ TUNABLES = [
 DEFAULTS = {
     "data_dir": os.path.join(app_dir(), "nifty_tracker_data"),
     "theme": "auto", "sound": True, "notify": True, "notify_all": False, "autostart": False,
+    "ideas_popup": True, "ideas_on_top": False,
     "lots": engine.LOTS, "brokerage": engine.BROKERAGE_PER_ORDER, "instrument": "NIFTY",
     "lot_sizes": {k: v["lot"] for k, v in engine.INSTRUMENTS.items()},
     "tunables": {k: getattr(engine, k) for k, *_ in TUNABLES},
@@ -1125,8 +1126,15 @@ class SignalFeed(QWidget):
         for k, fr in self.cards.items():
             self.style_card(fr, k == key)
         if scroll and key in self.cards:
-            fr = self.cards[key]
-            QTimer.singleShot(0, lambda: self.area.ensureWidgetVisible(fr, 0, 40))
+            QTimer.singleShot(0, lambda: self._scroll_to(key))
+
+    def _scroll_to(self, key):
+        fr = self.cards.get(key)
+        if fr is not None:
+            try:
+                self.area.ensureWidgetVisible(fr, 0, 40)
+            except RuntimeError:
+                pass
 
     def style_card(self, fr, on):
         col = dir_color(fr.sig["direction"])
@@ -1192,11 +1200,13 @@ class SignalFeed(QWidget):
             tr.setWordWrap(True)
             tr.setStyleSheet("font-weight:600;" if s.get("plan") else f"color:{T['ink2']};")
             lay.addWidget(tr)
-        if s.get("option"):
-            op = QLabel(str(s["option"]))
-            op.setTextFormat(Qt.PlainText)
-            op.setWordWrap(True)
-            op.setStyleSheet(f"background:{T['atm']}; border-radius:6px; padding:5px 8px; font-weight:600;")
+        p = s.get("plan")
+        if p:
+            sh = p.get("short")
+            txt = (f"Buy {p['strike']:,.0f} {p['opt']}" + (f"  ·  or sell {sh['strike']:,.0f} {sh['opt']}" if sh else "")
+                   + "  →  Trade ideas window (Ctrl+T)")
+            op = QLabel(txt)
+            op.setStyleSheet(f"background:{T['atm']}; border-radius:6px; padding:4px 8px; color:{T['ink2']};")
             lay.addWidget(op)
         r = s.get("result")
         if r:
@@ -1220,6 +1230,224 @@ class SignalFeed(QWidget):
 
 
 # --------------------------------------------------------------------------- settings dialog
+# --------------------------------------------------------------------------- trade ideas window
+class IdeaTicket(QFrame):
+    clicked = Signal(object)
+
+    def __init__(self, sig):
+        super().__init__()
+        self.sig = sig
+        self.setObjectName("card")
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self.sig)
+
+
+class TradeIdeasWindow(QWidget):
+    """Separate window: every trade idea as a ticket with two ways to trade it -
+    BUY an option (limited risk) or SELL the opposite option (collect premium, needs margin)."""
+    selected = Signal(object)
+
+    def __init__(self, parent):
+        super().__init__(parent, Qt.Window)
+        self.setWindowTitle("Trade ideas")
+        self.resize(760, 760)
+        self.setObjectName("page")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 12, 14, 12)
+        v.setSpacing(8)
+        head = QHBoxLayout()
+        self.title = QLabel("Trade ideas")
+        self.title.setStyleSheet("font-size:14pt; font-weight:650;")
+        head.addWidget(self.title)
+        head.addStretch()
+        self.only_open = QCheckBox("Open only")
+        self.only_open.toggled.connect(lambda _: self.render())
+        self.popup = QCheckBox("Pop up on new idea")
+        self.on_top = QCheckBox("Keep on top")
+        self.on_top.toggled.connect(self.set_on_top)
+        for w in (self.only_open, self.popup, self.on_top):
+            head.addWidget(w)
+        v.addLayout(head)
+        self.summary = QLabel("")
+        self.summary.setObjectName("muted")
+        self.summary.setWordWrap(True)
+        v.addWidget(self.summary)
+        self.area = QScrollArea()
+        self.area.setWidgetResizable(True)
+        v.addWidget(self.area, 1)
+        note = QLabel("BUY = pay the premium; the most you can lose is what you paid.  SELL = receive the premium; "
+                      "needs margin, and the loss is NOT limited if the index runs past the stop - always place the "
+                      "stop (buy-back) order. Prices are the suggestion-time quotes; margin is a rough estimate. "
+                      "Educational tool – not trading advice.")
+        note.setObjectName("ts")
+        note.setWordWrap(True)
+        v.addWidget(note)
+        self.signals, self.sel_key, self.new_keys, self.tickets = [], None, set(), {}
+
+    def set_on_top(self, on):
+        vis = self.isVisible()
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, on)
+        if vis:
+            self.show()
+
+    def set_signals(self, signals):
+        self.signals = [s for s in signals if s.get("plan")]
+        if self.isVisible():
+            self.render()
+
+    def set_selected(self, key):
+        self.sel_key = key
+        for k, fr in self.tickets.items():
+            self.style_ticket(fr, k == key)
+        if key in self.tickets and self.isVisible():
+            QTimer.singleShot(0, lambda: self._scroll_to(key))
+
+    def _scroll_to(self, key):
+        fr = self.tickets.get(key)                    # looked up now: a re-render may have replaced it
+        if fr is not None:
+            try:
+                self.area.ensureWidgetVisible(fr, 0, 30)
+            except RuntimeError:
+                pass
+
+    def announce(self, sigs):
+        """New live trade ideas: mark them and, if wanted, bring the window forward."""
+        ideas = [s for s in sigs if s.get("plan")]
+        if not ideas:
+            return
+        self.new_keys |= {sig_key(s) for s in ideas}
+        if self.popup.isChecked():
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        self.render()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.render()
+
+    def style_ticket(self, fr, on):
+        col = dir_color(fr.sig["direction"])
+        fr.setStyleSheet(f"QFrame#card {{ border:{'2px' if on else '1px'} solid {T['accent'] if on else T['line']};"
+                         f" border-left:5px solid {col}; {'background:' + T['atm'] + ';' if on else ''} }}")
+
+    def render(self):
+        pos = self.area.verticalScrollBar().value()
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(0, 0, 6, 0)
+        lay.setSpacing(10)
+        self.tickets = {}
+        sigs = [s for s in self.signals
+                if not self.only_open.isChecked() or (s.get("result") or {}).get("status", "OPEN") == "OPEN"]
+        name = engine.INSTRUMENTS[engine.INSTRUMENT]["label"]
+        self.title.setText(f"Trade ideas · {name}")
+        buy_tot = sum(((s.get("result") or {}).get("money") or {}).get("net", 0) for s in self.signals)
+        sell_tot = sum(((s.get("result") or {}).get("short_money") or {}).get("net", 0) for s in self.signals)
+        n_open = sum(1 for s in self.signals if (s.get("result") or {}).get("status", "OPEN") == "OPEN")
+        self.summary.setText(f"{len(self.signals)} ideas today · {n_open} open · if every idea was taken "
+                             f"({engine.LOTS} lot × {engine.LOT_SIZE}):  buying {rs(buy_tot)}  ·  selling {rs(sell_tot)}"
+                             if self.signals else "No trade ideas yet – they appear here as soon as one is found.")
+        for s in reversed(sigs):
+            lay.addWidget(self.ticket(s))
+        if not sigs and self.signals:
+            lab = QLabel("No open ideas.")
+            lab.setObjectName("muted")
+            lay.addWidget(lab)
+        lay.addStretch()
+        self.area.setWidget(inner)
+        QTimer.singleShot(0, lambda: self.area.verticalScrollBar().setValue(pos))
+
+    def ticket(self, s):
+        p, r = s["plan"], s.get("result") or {}
+        key = sig_key(s)
+        fr = IdeaTicket(s)
+        fr.clicked.connect(self.selected.emit)
+        self.tickets[key] = fr
+        self.style_ticket(fr, key == self.sel_key)
+        v = QVBoxLayout(fr)
+        v.setContentsMargins(14, 10, 14, 12)
+        v.setSpacing(6)
+        col = dir_color(s["direction"])
+        gcol = {"A": T["up"], "B": T["accent"], "C": T["ink2"]}.get(s.get("grade"), T["ink2"])
+        status = r.get("status", "OPEN")
+        scol = T["up"] if r.get("points", 0) > 0 else T["dn"] if r.get("points", 0) < 0 else T["ink2"]
+        new = (f"&nbsp;&nbsp;<span style='background:{T['accent']}; color:{T['accent_ink']}; font-weight:700;'>"
+               f"&nbsp;NEW&nbsp;</span>") if key in self.new_keys else ""
+        head = QLabel(f"<span style='color:{T['ink2']};'>{s['time']:%H:%M}</span>&nbsp;&nbsp;"
+                      f"<b style='color:{col};'>{esc(s['kind'])}</b>&nbsp;&nbsp;"
+                      f"<b style='color:{gcol};'>Grade {s.get('grade', '')}</b>{new}"
+                      f"<span style='float:right;'>&nbsp;&nbsp;&nbsp;<b style='color:{scol};'>{status}</b>"
+                      f"{' at ' + format(r['exit_time'], '%H:%M') if r.get('exit_time') else ''}"
+                      f"{' · ' + format(r['points'], '+,.0f') + ' pts' if r else ''}</span>")
+        v.addWidget(head)
+        side = "LONG" if p["dir"] == "bullish" else "SHORT"
+        lv = QLabel(f"{engine.NAME} {side}:  entry <b>{p['entry']:,.0f}</b> · stop <b style='color:{T['dn']};'>"
+                    f"{p['stop']:,.0f}</b> · target <b style='color:{T['up']};'>{p['target']:,.0f}</b>"
+                    f"  <span style='color:{T['ink2']};'>(R:R {abs(p['target'] - p['entry']) / max(0.01, abs(p['entry'] - p['stop'])):.1f})</span>")
+        v.addWidget(lv)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        exp = (p.get("expiry") or "")[:6]
+        qty = engine.LOTS * engine.LOT_SIZE
+        est = "" if p.get("prem_real") else " (est.)"
+        m = r.get("money")
+        row.addWidget(self.leg(
+            "BUY", T["accent"], f"BUY {engine.INSTRUMENT} {exp} {p['strike']:,.0f} {p['opt']}",
+            [("Buy at", f"₹{p['prem']:,.1f}{est}"),
+             ("Stop (sell)", f"₹{p['p_stop']:,.1f}" if p.get("p_stop") else "–"),
+             ("Target (sell)", f"₹{p['p_target']:,.1f}" if p.get("p_target") else "–"),
+             ("You pay", rs(p["prem"] * qty, sign=False)),
+             ("Max loss", rs(-p["prem"] * qty) + " (premium)")],
+            m, status))
+        sh = p.get("short")
+        if sh:
+            est2 = "" if sh.get("prem_real") else " (est.)"
+            row.addWidget(self.leg(
+                "SELL", T["warn"], f"SELL {engine.INSTRUMENT} {exp} {sh['strike']:,.0f} {sh['opt']}",
+                [("Sell at", f"₹{sh['prem']:,.1f}{est2}"),
+                 ("Stop (buy back)", f"₹{sh['p_stop']:,.1f}"),
+                 ("Target (buy back)", f"₹{sh['p_target']:,.1f}"),
+                 ("You receive", rs(sh["prem"] * qty, sign=False)),
+                 ("Margin ≈", rs(sh["margin_per_unit"] * qty, sign=False))],
+                r.get("short_money"), status))
+        v.addLayout(row)
+        for w in fr.findChildren(QLabel):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents)
+        return fr
+
+    def leg(self, label, colr, title, rows, m, status):
+        box = QFrame()
+        box.setStyleSheet(f"QFrame {{ background:{T['bg']}; border:1px solid {T['line']}; border-radius:8px; }}"
+                          f" QLabel {{ border:none; background:transparent; }}")
+        g = QGridLayout(box)
+        g.setContentsMargins(10, 8, 10, 8)
+        g.setHorizontalSpacing(12)
+        g.setVerticalSpacing(3)
+        t = QLabel(f"<span style='background:{colr}; color:#ffffff; font-weight:700;'>&nbsp;{label}&nbsp;</span>"
+                   f"&nbsp;&nbsp;<b>{esc(title)}</b>")
+        g.addWidget(t, 0, 0, 1, 2)
+        for i, (a, b) in enumerate(rows, 1):
+            la = QLabel(a)
+            la.setObjectName("ts")
+            lb = QLabel(b)
+            lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lb.setStyleSheet("font-weight:600;")
+            g.addWidget(la, i, 0)
+            g.addWidget(lb, i, 1)
+        if m:
+            net = m["net"]
+            c = T["up"] if net > 0 else T["dn"] if net < 0 else T["ink2"]
+            res = QLabel(f"{'Now' if status == 'OPEN' else 'Result'}: <b style='color:{c};'>{rs(net)}</b>"
+                         f"<span style='color:{T['ink2']};'> after ₹{m['charges']:,.0f} charges</span>")
+            g.addWidget(res, len(rows) + 1, 0, 1, 2)
+        return box
+
+
+# --------------------------------------------------------------------------- settings dialog (cont.)
 class SettingsDialog(QDialog):
     def __init__(self, parent, settings):
         super().__init__(parent)
@@ -1373,6 +1601,12 @@ class MainWindow(QMainWindow):
             self.tray.activated.connect(lambda *_: (self.showNormal(), self.activateWindow()))
             self.tray.show()
         self.build()
+        self.ideas = TradeIdeasWindow(self)
+        self.ideas.popup.setChecked(self.settings.get("ideas_popup", True))
+        self.ideas.on_top.setChecked(self.settings.get("ideas_on_top", False))
+        self.ideas.popup.toggled.connect(lambda on: self._save_pref("ideas_popup", on))
+        self.ideas.on_top.toggled.connect(lambda on: self._save_pref("ideas_on_top", on))
+        self.ideas.selected.connect(lambda sig: self.select_signal(sig, show_chart=True))
         self.build_shortcuts()
         self.update_index_labels()
         self.apply_theme()
@@ -1439,6 +1673,11 @@ class MainWindow(QMainWindow):
         h.addWidget(self.mode)
         h.addWidget(self.expiry)
         h.addWidget(self.start_btn)
+        self.ideas_btn = QToolButton()
+        self.ideas_btn.setText("Trade ideas")
+        self.ideas_btn.setToolTip("Open the trade-ideas window: buy or sell option for every idea (Ctrl+T)")
+        self.ideas_btn.clicked.connect(self.show_ideas)
+        h.addWidget(self.ideas_btn)
         for text, tip, fn in (("Folder", "Open the data folder", self.open_folder),
                               ("Web view", "Open the HTML dashboard in your browser", self.open_html),
                               ("Settings", "Settings and signal rules", self.open_settings)):
@@ -1759,10 +1998,14 @@ class MainWindow(QMainWindow):
         for s in sigs:
             self.log_line(f"{s['kind']} @ {s['price']:,.2f} - {s['text']}")
         trade = [s for s in sigs if s.get("plan")]
+        self.ideas.announce(trade)
         if self.settings["notify"] and (trade or (self.settings["notify_all"] and sigs)):
             s = (trade or sigs)[0]
             title = f"{s['kind']}" + (f" · grade {s['grade']}" if s.get("plan") else "") + f" @ {s['price']:,.0f}"
             body = s.get("option") or s.get("trade") or s["text"]
+            sh = (s.get("plan") or {}).get("short")
+            if sh:
+                body += f"\nor SELL {sh['strike']:,.0f} {sh['opt']} @ ~Rs {sh['prem']:,.1f}"
             if self.tray:
                 self.tray.showMessage(title, body, QSystemTrayIcon.Information, 10000)
             QApplication.alert(self, 0)
@@ -1867,7 +2110,7 @@ class MainWindow(QMainWindow):
 
     # ---- interaction
     def build_shortcuts(self):
-        keys = [("F5", self.toggle), ("Esc", lambda: self.select_signal(None)),
+        keys = [("Ctrl+T", self.show_ideas), ("F5", self.toggle), ("Esc", lambda: self.select_signal(None)),
                 ("Ctrl+Up", lambda: self.step_signal(-1)), ("Ctrl+Down", lambda: self.step_signal(1)),
                 ("Ctrl+0", self.chart.reset_view), ("Ctrl+=", lambda: self.chart.zoom(0.8, 1.0)),
                 ("Ctrl++", lambda: self.chart.zoom(0.8, 1.0)), ("Ctrl+-", lambda: self.chart.zoom(1.25, 1.0))]
@@ -1875,9 +2118,20 @@ class MainWindow(QMainWindow):
         for seq, fn in keys:
             QShortcut(QKeySequence(seq), self, activated=fn)
 
+    def show_ideas(self):
+        self.ideas.show()
+        self.ideas.raise_()
+        self.ideas.activateWindow()
+
+    def _save_pref(self, key, val):
+        self.settings[key] = val
+        save_settings(self.settings)
+
     def select_signal(self, sig, scroll_feed=True, show_chart=True):
-        """One selection shared by the chart, the feed and the status bar."""
+        """One selection shared by the chart, the feed, the trade-ideas window and the status bar."""
         self.sel_key = sig_key(sig) if sig else None
+        if hasattr(self, "ideas"):
+            self.ideas.set_selected(self.sel_key)
         self.chart.set_selected(self.sel_key)
         self.feed.set_selected(self.sel_key, scroll=scroll_feed)
         if not sig:
@@ -1971,6 +2225,10 @@ class MainWindow(QMainWindow):
         self.refresh_chain()
         self.refresh_scorecard()
         self.feed.set_signals(self.signals)
+        if hasattr(self, "ideas"):
+            self.ideas.set_signals(self.signals)
+            n = sum(1 for x in self.signals if x.get("plan"))
+            self.ideas_btn.setText(f"Trade ideas ({n})" if n else "Trade ideas")
 
     def refresh_tiles(self):
         for k, t in self.tiles.items():

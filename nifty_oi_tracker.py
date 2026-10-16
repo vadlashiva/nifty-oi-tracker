@@ -645,12 +645,54 @@ def option_premium(snap, k, opt):
     return bs_price(snap["candle"]["close"], k, years_to_expiry(snap.get("expiry"), snap["time"]), iv, opt), False
 
 
+SHORT_MARGIN_PCT = 9.0       # rough margin to sell one option, % of index value x quantity (check your broker)
+
+
+def short_plan(snap, direction, entry, stop, target):
+    """Option-selling version of the same idea: bullish -> SELL a put, bearish -> SELL a call, one strike
+    out of the money. Premium now, and the estimated premium if the index reaches the stop (you buy back
+    higher = loss) or the target (you buy back lower = profit)."""
+    opt = "PE" if direction == "bullish" else "CE"
+    st = snap["strikes"]
+    atm = min(st, key=lambda x: abs(x - entry))
+    want = atm - STRIKE_STEP if opt == "PE" else atm + STRIKE_STEP
+    k = want if want in st else atm
+    prem, real = option_premium(snap, k, opt)
+    v = st.get(k, {})
+    iv = v.get(opt.lower() + "_iv") or DEFAULT_IV
+    yrs = years_to_expiry(snap.get("expiry"), snap["time"])
+    model_now = bs_price(entry, k, yrs, iv, opt)
+    p_stop = max(0.05, prem + bs_price(stop, k, yrs, iv, opt) - model_now)
+    p_tgt = max(0.05, prem + bs_price(target, k, yrs, iv, opt) - model_now)
+    return {"strike": k, "opt": opt, "prem": prem, "prem_real": real, "p_stop": p_stop, "p_target": p_tgt,
+            "margin_per_unit": entry * SHORT_MARGIN_PCT / 100}
+
+
 def trade_plan(snap, direction, entry, stop, target):
     opt = "PE" if direction == "bearish" else "CE"
     k = min(snap["strikes"], key=lambda x: abs(x - entry))
     prem, real = option_premium(snap, k, opt)
-    return {"dir": direction, "entry": entry, "stop": stop, "target": target, "strike": k, "opt": opt,
-            "prem": prem, "prem_real": real}
+    v = snap["strikes"].get(k, {})
+    iv = v.get(opt.lower() + "_iv") or DEFAULT_IV
+    yrs = years_to_expiry(snap.get("expiry"), snap["time"])
+    model_now = bs_price(entry, k, yrs, iv, opt)
+    plan = {"dir": direction, "entry": entry, "stop": stop, "target": target, "strike": k, "opt": opt,
+            "prem": prem, "prem_real": real, "expiry": snap.get("expiry"),
+            "p_stop": max(0.05, prem + bs_price(stop, k, yrs, iv, opt) - model_now),
+            "p_target": max(0.05, prem + bs_price(target, k, yrs, iv, opt) - model_now)}
+    try:
+        plan["short"] = short_plan(snap, direction, entry, stop, target)
+    except (ValueError, ZeroDivisionError, KeyError):
+        plan["short"] = None
+    return plan
+
+
+def money_short(entry_prem, exit_prem, lots=None, lot_size=None):
+    """Rs result of SELLING `lots` x `lot_size` units at entry_prem and buying back at exit_prem."""
+    qty = (lots or LOTS) * (lot_size or LOT_SIZE)
+    sell, buy = entry_prem * qty, max(0.0, exit_prem) * qty
+    ch = trade_charges(buy, sell)
+    return {"qty": qty, "buy": buy, "sell": sell, "gross": sell - buy, "charges": ch, "net": sell - buy - ch}
 
 
 def evaluate_trades(snaps, signals):
@@ -696,11 +738,22 @@ def evaluate_trades(snaps, signals):
             else:
                 px, _ = option_premium(ref_snap, p["strike"], p["opt"])
             opt_pnl = px - p["prem"]
+        sh, short_exit = p.get("short"), None
+        if sh and ref_snap is not None:
+            if exit_snap is not None and status in ("STOP HIT", "TARGET HIT") and not ref_snap.get("live"):
+                v = ref_snap["strikes"].get(sh["strike"], {})
+                iv = v.get(sh["opt"].lower() + "_iv") or DEFAULT_IV
+                short_exit = bs_price(exit_px, sh["strike"],
+                                      years_to_expiry(ref_snap.get("expiry"), ref_snap["time"]), iv, sh["opt"])
+            else:
+                short_exit, _ = option_premium(ref_snap, sh["strike"], sh["opt"])
         results.append({"sig": sig, "status": status, "exit_time": exit_snap["time"] if exit_snap else None,
                         "points": pts, "best": best, "worst": worst, "opt_pnl": opt_pnl,
                         "opt_real": p["prem_real"],
                         "exit_prem": (p["prem"] + opt_pnl) if opt_pnl is not None else None,
-                        "money": money(p["prem"], p["prem"] + opt_pnl) if opt_pnl is not None else None})
+                        "money": money(p["prem"], p["prem"] + opt_pnl) if opt_pnl is not None else None,
+                        "short_exit_prem": short_exit,
+                        "short_money": money_short(sh["prem"], short_exit) if short_exit is not None else None})
         sig["result"] = results[-1]
     return results
 
