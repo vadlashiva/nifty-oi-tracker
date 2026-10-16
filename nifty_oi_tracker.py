@@ -645,17 +645,19 @@ def option_premium(snap, k, opt):
     return bs_price(snap["candle"]["close"], k, years_to_expiry(snap.get("expiry"), snap["time"]), iv, opt), False
 
 
+SELL_COOLDOWN_MIN = 45       # minutes: one OI-wall sell idea per level inside this window
+SELL_NEAR_ATR = 1.5          # the candle must come within this many average ranges of the OI wall
 SHORT_MARGIN_PCT = 9.0       # rough margin to sell one option, % of index value x quantity (check your broker)
 
 
-def short_plan(snap, direction, entry, stop, target):
+def short_plan(snap, direction, entry, stop, target, strike=None):
     """Option-selling version of the same idea: bullish -> SELL a put, bearish -> SELL a call, one strike
-    out of the money. Premium now, and the estimated premium if the index reaches the stop (you buy back
-    higher = loss) or the target (you buy back lower = profit)."""
+    out of the money (or `strike`). Premium now, and the estimated premium if the index reaches the stop
+    (you buy back higher = loss) or the target (you buy back lower = profit)."""
     opt = "PE" if direction == "bullish" else "CE"
     st = snap["strikes"]
     atm = min(st, key=lambda x: abs(x - entry))
-    want = atm - STRIKE_STEP if opt == "PE" else atm + STRIKE_STEP
+    want = strike if strike is not None else (atm - STRIKE_STEP if opt == "PE" else atm + STRIKE_STEP)
     k = want if want in st else atm
     prem, real = option_premium(snap, k, opt)
     v = st.get(k, {})
@@ -751,7 +753,8 @@ def evaluate_trades(snaps, signals):
                         "points": pts, "best": best, "worst": worst, "opt_pnl": opt_pnl,
                         "opt_real": p["prem_real"],
                         "exit_prem": (p["prem"] + opt_pnl) if opt_pnl is not None else None,
-                        "money": money(p["prem"], p["prem"] + opt_pnl) if opt_pnl is not None else None,
+                        "money": money(p["prem"], p["prem"] + opt_pnl)
+                        if opt_pnl is not None and not p.get("sell_only") else None,
                         "short_exit_prem": short_exit,
                         "short_money": money_short(sh["prem"], short_exit) if short_exit is not None else None})
         sig["result"] = results[-1]
@@ -887,6 +890,7 @@ def check_signals(prev, cur):
     # carry the break log forward even when we return early
     cur["_break_log"] = dict((prev or {}).get("_break_log", {}))
     cur["_rev_done"] = dict((prev or {}).get("_rev_done", {}))
+    cur["_sell_log"] = dict((prev or {}).get("_sell_log", {}))
     cur["pa"] = price_action(cur.get("candles") or ([cur["candle"]] if cur.get("candle") else []), cur.get("atr"))
     cur["_tot_hist"] = ((prev or {}).get("_tot_hist", []) + [(cur["tce"], cur["tpe"])])[-(REV_OI_CANDLES + 1):]
     if cur.get("candle"):
@@ -1136,6 +1140,63 @@ def check_signals(prev, cur):
                 f"Tested support {Sk:,.0f} (low {c['low']:,.2f}) and closed green at {c['close']:,.2f}; "
                 f"put OI there {d_oi(Sk, 'pe'):+,.0f}", f"Support holding - avoid shorts above {Sk:,.0f}", Sk)
 
+    # 4b: option-selling ideas at the OI walls - SELL CE under the max-call-OI strike while it caps the
+    #     price, SELL PE above the max-put-OI strike while it holds. Index stop just beyond the wall;
+    #     the profit comes mostly from the premium shrinking, so the index target is modest.
+    def sell_idea(opt, wall):
+        bear = opt == "CE"
+        key = f"{opt}{wall:.0f}"
+        last = cur["_sell_log"].get(key)
+        if last is not None and (cur["time"] - last).total_seconds() < SELL_COOLDOWN_MIN * 60:
+            return
+        near = max(LEVEL_STICKY, SELL_NEAR_ATR * atr)
+        rng = max(c["high"] - c["low"], 0.01)
+        if bear:
+            ok = (c["close"] < wall and c["high"] < wall + BREAK_MIN and wall - c["high"] <= near
+                  and (c["close"] < c["open"] or (c["high"] - c["close"]) >= 0.4 * rng))
+        else:
+            ok = (c["close"] > wall and c["low"] > wall - BREAK_MIN and c["low"] - wall <= near
+                  and (c["close"] > c["open"] or (c["close"] - c["low"]) >= 0.4 * rng))
+        if not ok:
+            return
+        cur["_sell_log"][key] = cur["time"]
+        side = "ce" if bear else "pe"
+        d_wall = d_oi(wall, side)
+        conf = 1 + (1 if d_wall > 0 else 0)          # the biggest OI wall, plus writers still adding
+        entry = c["close"]
+        stp = round(wall + stop_dist) if bear else round(wall - stop_dist)
+        risk = abs(stp - entry)
+        tgt = round(entry - 1.5 * risk) if bear else round(entry + 1.5 * risk)
+        if atr and abs(tgt - entry) > TARGET_CAP_ATR * atr:
+            tgt = round(entry - TARGET_CAP_ATR * atr) if bear else round(entry + TARGET_CAP_ATR * atr)
+        kind = "SELL CE" if bear else "SELL PE"
+        where = (f"Stayed under the call-OI wall {wall:,.0f} (high {c['high']:,.2f}, close {c['close']:,.2f})" if bear
+                 else f"Held above the put-OI wall {wall:,.0f} (low {c['low']:,.2f}, close {c['close']:,.2f})")
+        text = f"{where}; {'call' if bear else 'put'} OI there {d_wall:+,.0f} - writers defending it"
+        if late or expiry_eve:
+            add(kind, "bearish" if bear else "bullish", text,
+                f"No new trades after {NO_NEW_TRADES_AFTER:%H:%M}" if late else
+                f"No new trades after {EXPIRY_EVE_MUTE_FROM:%H:%M} this close to expiry", wall, oi_conf=conf)
+            return
+        plan = trade_plan(cur, "bearish" if bear else "bullish", entry, stp, tgt)
+        plan["sell_only"] = True
+        try:
+            plan["short"] = short_plan(cur, "bearish" if bear else "bullish", entry, stp, tgt, strike=wall)
+        except (ValueError, ZeroDivisionError, KeyError):
+            return
+        sh = plan["short"]
+        exp = (cur.get("expiry") or "")[:6]
+        trade = (f"Sell {wall:,.0f} {opt}: buy back if {NAME} reaches {stp:,.0f}; "
+                 f"aim {NAME} {tgt:,.0f} or keep ~half the premium (risk {risk:.0f} pts)")
+        option = (f"SELL {INSTRUMENT} {exp} {sh['strike']:,.0f} {opt} @ ~Rs {sh['prem']:,.1f} | "
+                  f"buy back ~Rs {sh['p_stop']:,.1f} ({NAME} {stp:,.0f}) | target ~Rs {sh['p_target']:,.1f}")
+        add(kind, "bearish" if bear else "bullish", text, trade, wall, option, plan, oi_conf=conf)
+
+    if R and not any(x["kind"] in ("BREAKOUT", "OR BREAKOUT") for x in sigs):
+        sell_idea("CE", R)
+    if S and not any(x["kind"] in ("BREAKDOWN", "OR BREAKDOWN") for x in sigs):
+        sell_idea("PE", S)
+
     # 5: OI flow over the last 5 minutes (skipped with estimated OI and near expiry close)
     move = c["close"] - pc["close"]
     dce_t, dpe_t = cur["tce"] - prev["tce"], cur["tpe"] - prev["tpe"]
@@ -1289,6 +1350,17 @@ class Recorder:
                         "net_rs"])
             for r in results:
                 p, sg = r["sig"]["plan"], r["sig"]
+                if p.get("sell_only") and p.get("short"):
+                    sh, sm = p["short"], r.get("short_money")
+                    w.writerow([f'{sg["time"]:%H:%M}', sg["kind"], sg.get("grade", ""), round(p["entry"], 2),
+                                p["stop"], p["target"], f'SELL {sh["strike"]:.0f} {sh["opt"]}', round(sh["prem"], 2),
+                                r["status"], f'{r["exit_time"]:%H:%M}' if r["exit_time"] else "",
+                                round(r["points"], 2), round(r["best"], 2), round(r["worst"], 2), "",
+                                "real LTP" if sh.get("prem_real") else "estimated",
+                                round(r["short_exit_prem"], 2) if r.get("short_exit_prem") is not None else "",
+                                *([sm["qty"], round(sm["sell"], 2), round(sm["gross"], 2), round(sm["charges"], 2),
+                                   round(sm["net"], 2)] if sm else ["", "", "", "", ""])])
+                    continue
                 w.writerow([f'{sg["time"]:%H:%M}', sg["kind"], sg.get("grade", ""), round(p["entry"], 2), p["stop"],
                             p["target"], f'{p["strike"]:.0f} {p["opt"]}', round(p["prem"], 2), r["status"],
                             f'{r["exit_time"]:%H:%M}' if r["exit_time"] else "", round(r["points"], 2),
@@ -1373,7 +1445,7 @@ def _sig_positions(snaps):
     for s in snaps:
         for sig in s.get("_signals", []):
             if sig["kind"] in ("BREAKDOWN", "BREAKOUT", "REJECTION", "BOUNCE", "REVERSAL UP", "REVERSAL DOWN",
-                               "OR BREAKOUT", "OR BREAKDOWN") \
+                               "OR BREAKOUT", "OR BREAKDOWN", "SELL CE", "SELL PE") \
                     and sig["time"] in idx:
                 res.append((idx[sig["time"]], sig))
     return res

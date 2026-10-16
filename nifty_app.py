@@ -501,7 +501,7 @@ class ChartWidget(QWidget):
     """Candles + OI levels. Scroll = zoom, drag = pan, double-click = reset,
     click a marker (or a candle with a signal) = select it and draw its entry / stop / target."""
     MARKED = ("BREAKDOWN", "BREAKOUT", "REJECTION", "BOUNCE", "REVERSAL UP", "REVERSAL DOWN",
-              "OR BREAKOUT", "OR BREAKDOWN")
+              "OR BREAKOUT", "OR BREAKDOWN", "SELL CE", "SELL PE")
     signal_clicked = Signal(object)          # signal dict, or None to clear
     view_changed = Signal()
 
@@ -1123,7 +1123,8 @@ class SignalCard(QFrame):
 
 class SignalFeed(QWidget):
     selected = Signal(object)            # signal dict or None
-    FILTERS = ["All signals", "Trade ideas only", "Graded A/B only", "Bullish only", "Bearish only"]
+    FILTERS = ["All signals", "Trade ideas only", "Graded A/B only", "Sell CE / PE ideas", "Bullish only",
+               "Bearish only"]
     NEW_SECONDS = 120
 
     def __init__(self):
@@ -1171,6 +1172,7 @@ class SignalFeed(QWidget):
     def visible(self):
         f = self.filter.currentIndex()
         keep = [lambda s: True, lambda s: s.get("plan"), lambda s: s.get("plan") and s.get("grade") in ("A", "B"),
+                lambda s: s["kind"] in ("SELL CE", "SELL PE"),
                 lambda s: s["direction"] == "bullish", lambda s: s["direction"] == "bearish"][f]
         return [s for s in self.signals if keep(s)]
 
@@ -1256,8 +1258,11 @@ class SignalFeed(QWidget):
         p = s.get("plan")
         if p:
             sh = p.get("short")
-            txt = (f"Buy {p['strike']:,.0f} {p['opt']}" + (f"  ·  or sell {sh['strike']:,.0f} {sh['opt']}" if sh else "")
-                   + "  →  Trade ideas window (Ctrl+T)")
+            if p.get("sell_only") and sh:
+                txt = f"Sell {sh['strike']:,.0f} {sh['opt']} @ ~₹{sh['prem']:,.1f}  →  Trade ideas window (Ctrl+T)"
+            else:
+                txt = (f"Buy {p['strike']:,.0f} {p['opt']}" + (f"  ·  or sell {sh['strike']:,.0f} {sh['opt']}" if sh else "")
+                       + "  →  Trade ideas window (Ctrl+T)")
             op = QLabel(txt)
             op.setStyleSheet(f"background:{T['atm']}; border-radius:6px; padding:4px 8px; color:{T['ink2']};")
             lay.addWidget(op)
@@ -1316,6 +1321,11 @@ class TradeIdeasWindow(QWidget):
         self.title.setStyleSheet("font-size:14pt; font-weight:650;")
         head.addWidget(self.title)
         head.addStretch()
+        self.view = QComboBox()
+        self.view.addItems(["Buy & sell", "Sell CE / PE only", "Buy only"])
+        self.view.setToolTip("Which way of trading each idea to show")
+        self.view.currentIndexChanged.connect(lambda _: self.render())
+        head.addWidget(self.view)
         self.only_open = QCheckBox("Open only")
         self.only_open.toggled.connect(lambda _: self.render())
         self.popup = QCheckBox("Pop up on new idea")
@@ -1394,11 +1404,14 @@ class TradeIdeasWindow(QWidget):
         lay.setContentsMargins(0, 0, 6, 0)
         lay.setSpacing(10)
         self.tickets = {}
+        mode = self.view.currentIndex()            # 0 both, 1 sell only, 2 buy only
         sigs = [s for s in self.signals
-                if not self.only_open.isChecked() or (s.get("result") or {}).get("status", "OPEN") == "OPEN"]
+                if (not self.only_open.isChecked() or (s.get("result") or {}).get("status", "OPEN") == "OPEN")
+                and (mode != 1 or s["plan"].get("short")) and (mode != 2 or not s["plan"].get("sell_only"))]
         name = engine.INSTRUMENTS[engine.INSTRUMENT]["label"]
         self.title.setText(f"Trade ideas · {name}")
-        buy_tot = sum(((s.get("result") or {}).get("money") or {}).get("net", 0) for s in self.signals)
+        buy_tot = sum(((s.get("result") or {}).get("money") or {}).get("net", 0) for s in self.signals
+                      if not s["plan"].get("sell_only"))
         sell_tot = sum(((s.get("result") or {}).get("short_money") or {}).get("net", 0) for s in self.signals)
         n_open = sum(1 for s in self.signals if (s.get("result") or {}).get("status", "OPEN") == "OPEN")
         self.summary.setText(f"{len(self.signals)} ideas today · {n_open} open · if every idea was taken "
@@ -1438,6 +1451,8 @@ class TradeIdeasWindow(QWidget):
                       f"{' · ' + format(r['points'], '+,.0f') + ' pts' if r else ''}</span>")
         v.addWidget(head)
         side = "LONG" if p["dir"] == "bullish" else "SHORT"
+        if p.get("sell_only"):
+            side = "should stay ABOVE the put wall" if p["dir"] == "bullish" else "should stay BELOW the call wall"
         lv = QLabel(f"{engine.NAME} {side}:  entry <b>{p['entry']:,.0f}</b> · stop <b style='color:{T['dn']};'>"
                     f"{p['stop']:,.0f}</b> · target <b style='color:{T['up']};'>{p['target']:,.0f}</b>"
                     f"  <span style='color:{T['ink2']};'>(R:R {abs(p['target'] - p['entry']) / max(0.01, abs(p['entry'] - p['stop'])):.1f})</span>")
@@ -1448,7 +1463,11 @@ class TradeIdeasWindow(QWidget):
         qty = engine.LOTS * engine.LOT_SIZE
         est = "" if p.get("prem_real") else " (est.)"
         m = r.get("money")
-        row.addWidget(self.leg(
+        mode = self.view.currentIndex()
+        show_buy = mode != 1 and not p.get("sell_only")
+        show_sell = mode != 2
+        if show_buy:
+            row.addWidget(self.leg(
             "BUY", T["accent"], f"BUY {engine.INSTRUMENT} {exp} {p['strike']:,.0f} {p['opt']}",
             [("Buy at", f"₹{p['prem']:,.1f}{est}"),
              ("Stop (sell)", f"₹{p['p_stop']:,.1f}" if p.get("p_stop") else "–"),
@@ -1457,7 +1476,7 @@ class TradeIdeasWindow(QWidget):
              ("Max loss", rs(-p["prem"] * qty) + " (premium)")],
             m, status))
         sh = p.get("short")
-        if sh:
+        if sh and show_sell:
             est2 = "" if sh.get("prem_real") else " (est.)"
             row.addWidget(self.leg(
                 "SELL", T["warn"], f"SELL {engine.INSTRUMENT} {exp} {sh['strike']:,.0f} {sh['opt']}",
@@ -1896,7 +1915,7 @@ class MainWindow(QMainWindow):
         self.sc_grades.setWordWrap(True)
         v.addWidget(self.sc_grades)
         self.trades = QTableWidget(0, 9)
-        self.trades.setHorizontalHeaderLabels(["Time", "Grade", "Trade", "Buy ₹", "Exit ₹", "Result", "Qty",
+        self.trades.setHorizontalHeaderLabels(["Time", "Grade", "Trade", "Entry ₹", "Exit ₹", "Result", "Qty",
                                                "Charges", "Net profit"])
         self.trades.verticalHeader().hide()
         self.trades.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -2424,14 +2443,21 @@ class MainWindow(QMainWindow):
         self.trades.setRowCount(len(res))
         for r, x in enumerate(reversed(res)):
             sg, p, m = x["sig"], x["sig"]["plan"], x.get("money")
+            sell = bool(p.get("sell_only") and p.get("short"))
+            if sell:
+                sh, m = p["short"], x.get("short_money")
+                leg, e_prem, x_prem = f"SELL {sh['strike']:,.0f} {sh['opt']}", sh["prem"], x.get("short_exit_prem")
+            else:
+                leg, e_prem, x_prem = f"BUY {p['strike']:,.0f} {p['opt']}", p["prem"], x.get("exit_prem")
             net = m["net"] if m else 0
             rc = T["up"] if net > 0 else T["dn"] if net < 0 else T["ink2"]
-            cells = [f"{sg['time']:%H:%M}", sg.get("grade", ""), f"BUY {p['strike']:,.0f} {p['opt']}",
-                     f"{p['prem']:,.1f}", f"{x['exit_prem']:,.1f}" if x.get("exit_prem") is not None else "–",
+            cells = [f"{sg['time']:%H:%M}", sg.get("grade", ""), leg,
+                     f"{e_prem:,.1f}", f"{x_prem:,.1f}" if x_prem is not None else "–",
                      x["status"] + (f" {x['exit_time']:%H:%M}" if x["exit_time"] and "15:30" not in x["status"] else ""),
                      str(m["qty"]) if m else "–", f"₹{m['charges']:,.0f}" if m else "–", rs(net) if m else "–"]
             tip = (f"{sg['kind']} · {engine.NAME} entry {p['entry']:,.0f}, stop {p['stop']:,.0f}, target {p['target']:,.0f} · "
-                   f"{x['points']:+,.0f} {engine.NAME} pts" + (f" · invested {rs(m['buy'], sign=False)}" if m else ""))
+                   f"{x['points']:+,.0f} {engine.NAME} pts" + (f" · invested {rs(m['buy'], sign=False)}" if m and not sell else "")
+                   + (" · sold first, bought back at exit (not in the buying totals above)" if sell else ""))
             for c, text in enumerate(cells):
                 it = QTableWidgetItem(text)
                 it.setToolTip(tip if not (x["status"] == "OPEN" and c in (5, 8)) else "Still running – value if you closed it now")
