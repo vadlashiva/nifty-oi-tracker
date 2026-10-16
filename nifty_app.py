@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal, QUrl, QRectF, QPointF
+from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal, QUrl, QRectF, QPointF, QLockFile
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPen,
                            QBrush, QPainterPath, QFontMetrics, QKeySequence, QShortcut)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QComboBox,
@@ -2055,6 +2055,14 @@ def main():
     app.setStyle("Fusion")
     f = QFont("Segoe UI" if os.name == "nt" else app.font().family(), 10)
     app.setFont(f)
+    # only one tracker at a time: two copies writing the same day's CSV files corrupt them
+    lock = QLockFile(os.path.join(app_dir(), ".nifty_tracker.lock"))
+    lock.setStaleLockTime(0)
+    if not lock.tryLock(200):
+        QMessageBox.information(None, APP_NAME, "Nifty OI Tracker is already running.\n\n"
+                                "Use the open window (check the taskbar and the system tray) - running two copies "
+                                "at once damages the day's recorded data.")
+        sys.exit(0)
     w = MainWindow()
     w.show()
     sys.exit(app.exec())

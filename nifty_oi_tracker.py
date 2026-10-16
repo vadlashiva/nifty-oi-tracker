@@ -1469,17 +1469,27 @@ def rebuild_snaps(src, expiry=None):
     rows = read(snap_p)
     by_time = {}
     for r in read(strike_p):
-        by_time.setdefault(_parse_hhmm(r["time"]), {})[float(r["strike"])] = {
+        # skip damaged lines (e.g. two trackers once wrote to the same file at the same time)
+        try:
+            key, strike = _parse_hhmm(r["time"]), float(r["strike"])
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if r.get("pe_iv") is None:
+            continue
+        by_time.setdefault(key, {})[strike] = {
             "ce_oi": _f(r["ce_oi"], 0), "ce_chg": _f(r["ce_day_chg"], 0), "ce_ltp": _f(r["ce_ltp"], 0),
             "ce_iv": _f(r["ce_iv"], 0), "ce_vol": 0.0,
             "pe_oi": _f(r["pe_oi"], 0), "pe_chg": _f(r["pe_day_chg"], 0), "pe_ltp": _f(r["pe_ltp"], 0),
             "pe_iv": _f(r["pe_iv"], 0), "pe_vol": 0.0}
-    candles, pts, prev = [], [], None
+    candles, pts, prev, seen = [], [], None, set()
     for r in rows:
         try:
             h, m = _parse_hhmm(r["time"])
-        except ValueError:
+        except (TypeError, ValueError, AttributeError):
             continue
+        if (h, m) in seen:                   # duplicate candle row
+            continue
+        seen.add((h, m))
         end = dt.datetime.combine(day, dt.time(h, m))
         start = end - dt.timedelta(minutes=5)
         c = {"start": start, "open": _f(r["open"]), "high": _f(r["high"]), "low": _f(r["low"]),
