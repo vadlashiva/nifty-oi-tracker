@@ -23,7 +23,7 @@ import time
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal, QUrl, QRectF, QPointF, QLockFile
 from PySide6.QtGui import (QPixmap, QLinearGradient, QAction, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPen,
                            QBrush, QPainterPath, QFontMetrics, QKeySequence, QShortcut)
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QComboBox,
+from PySide6.QtWidgets import (QMenu, QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QComboBox,
                                QHBoxLayout, QVBoxLayout, QGridLayout, QSplitter, QTabWidget, QTableWidget,
                                QTableWidgetItem, QHeaderView, QStyledItemDelegate, QScrollArea, QPlainTextEdit,
                                QDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit, QFileDialog,
@@ -176,13 +176,17 @@ def qss():
     QMainWindow::separator {{ background:{T['line']}; }}
     QFrame#card, QFrame#tile {{ background:{T['card']}; border:1px solid {T['line']}; border-radius:10px; }}
     QFrame#tile QLabel, QFrame#card QLabel, QFrame#header QLabel {{ background:transparent; }}
+    QWidget#headleft {{ background:transparent; }}
+    QMenu {{ background:{T['card']}; border:1px solid {T['line']}; padding:4px; }}
+    QMenu::item {{ padding:6px 18px; border-radius:6px; }}
+    QMenu::item:selected {{ background:{T['hover']}; color:{T['ink']}; }}
     QFrame#header {{ background:{T['card']}; border-bottom:1px solid {T['line']}; }}
     QLabel#title {{ font-size:15pt; font-weight:650; }}
     QLabel#muted, QLabel#tl {{ color:{T['ink2']}; }}
     QLabel#tl {{ font-size:9pt; }}
     QLabel#tv {{ font-size:17pt; font-weight:650; }}
     QLabel#ts {{ color:{T['ink2']}; font-size:9pt; }}
-    QLabel#pill {{ border-radius:11px; padding:3px 12px; font-weight:600; background:{T['hover']}; }}
+    QLabel#pill {{ border-radius:10px; padding:1px 10px; font-weight:600; background:{T['hover']}; }}
     QPushButton, QToolButton {{ background:{T['card']}; border:1px solid {T['line']}; border-radius:8px;
         padding:6px 14px; }}
     QPushButton:hover, QToolButton:hover {{ background:{T['hover']}; }}
@@ -1687,13 +1691,24 @@ class MainWindow(QMainWindow):
         title.setObjectName("title")
         self.subtitle = QLabel("Open interest + price action, every 5 minutes")
         self.subtitle.setObjectName("muted")
+        # title on top; date/expiry and the live status pill share the second line, so neither gets cut off
+        title.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
         tb.addWidget(title)
-        tb.addWidget(self.subtitle)
-        h.addLayout(tb)
-        h.addSpacing(12)
+        sub = QHBoxLayout()
+        sub.setSpacing(10)
+        sub.addWidget(self.subtitle)
         self.pill = QLabel("●  Ready")
         self.pill.setObjectName("pill")
-        h.addWidget(self.pill)
+        self.pill.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        sub.addWidget(self.pill)
+        sub.addStretch()
+        tb.addLayout(sub)
+        left = QWidget()
+        left.setObjectName("headleft")
+        left.setLayout(tb)
+        tb.setContentsMargins(0, 0, 0, 0)
+        left.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        h.addWidget(left)
         h.addStretch()
         self.index_box = QComboBox()
         self.index_keys = list(engine.INSTRUMENTS)
@@ -1719,6 +1734,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setObjectName("primary")
         self.start_btn.clicked.connect(self.toggle)
         self.start_btn.setToolTip("Start / stop (F5)")
+        for cb in (self.index_box, self.mode, self.expiry):
+            cb.setSizeAdjustPolicy(QComboBox.AdjustToContents)      # never clip "Live (market hours)"
         h.addWidget(self.mode)
         h.addWidget(self.expiry)
         h.addWidget(self.start_btn)
@@ -1727,14 +1744,21 @@ class MainWindow(QMainWindow):
         self.ideas_btn.setToolTip("Open the trade-ideas window: buy or sell option for every idea (Ctrl+T)")
         self.ideas_btn.clicked.connect(self.show_ideas)
         h.addWidget(self.ideas_btn)
-        for text, tip, fn in (("Folder", "Open the data folder", self.open_folder),
-                              ("Web view", "Open the HTML dashboard in your browser", self.open_html),
-                              ("Settings", "Settings and signal rules", self.open_settings)):
-            b = QToolButton()
-            b.setText(text)
-            b.setToolTip(tip)
-            b.clicked.connect(fn)
-            h.addWidget(b)
+        b = QToolButton()
+        b.setText("Settings")
+        b.setToolTip("Settings and signal rules")
+        b.clicked.connect(self.open_settings)
+        h.addWidget(b)
+        more = QToolButton()
+        more.setText("⋯")
+        more.setToolTip("Data folder, web view")
+        more.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(more)
+        menu.addAction("Open data folder", self.open_folder)
+        menu.addAction("Open web view (HTML dashboard)", self.open_html)
+        more.setMenu(menu)
+        more.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0; }")
+        h.addWidget(more)
         v.addWidget(header)
         self.countdown = QProgressBar()
         self.countdown.setObjectName("countdown")
