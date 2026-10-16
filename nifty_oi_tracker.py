@@ -100,6 +100,47 @@ HEADERS = {
     "Referer": URL_HOME,
 }
 
+# --------------------------------------------------------------------------- instruments
+# scale = typical index level / Nifty level, used to stretch every point-based rule (break distance,
+# stop buffer, level windows...) so one set of settings works for all three indices.
+INSTRUMENTS = {
+    "NIFTY": {"label": "Nifty 50", "short": "Nifty", "exchange": "NSE", "symbol": "NIFTY",
+              "chart_index": "NIFTY%2050", "step": 50, "lot": 65, "scale": 1.0},
+    "BANKNIFTY": {"label": "Bank Nifty", "short": "Bank Nifty", "exchange": "NSE", "symbol": "BANKNIFTY",
+                  "chart_index": "NIFTY%20BANK", "step": 100, "lot": 30, "scale": 2.2},
+    "SENSEX": {"label": "Sensex", "short": "Sensex", "exchange": "BSE", "symbol": "SENSEX",
+               "bse_scrip": "1", "yahoo": "%5EBSESN", "step": 100, "lot": 20, "scale": 3.3},
+}
+INSTRUMENT = "NIFTY"
+SCALE = 1.0
+NAME = "Nifty"
+_BASE_POINTS = {"LEVEL_WINDOW": LEVEL_WINDOW, "FRESH_WINDOW": FRESH_WINDOW, "PRICE_MOVE_MIN": PRICE_MOVE_MIN,
+                "REV_STOP_PAD": REV_STOP_PAD, "STOP_BUFFER": STOP_BUFFER, "BREAK_MIN": BREAK_MIN,
+                "LEVEL_STICKY": LEVEL_STICKY, "REV_MIN_SWING": REV_MIN_SWING}
+POINT_TUNABLES = ("STOP_BUFFER", "BREAK_MIN", "LEVEL_STICKY", "REV_MIN_SWING")
+
+
+def set_instrument(key, lot_size=None):
+    """Switch the whole engine to NIFTY / BANKNIFTY / SENSEX. Point-based rules are scaled from their
+    Nifty values; call apply-tunables code AFTER this (it scales user values the same way)."""
+    global INSTRUMENT, SCALE, NAME, STRIKE_STEP, LOT_SIZE, URL_EXPIRIES, URL_CHAIN, URL_CHART
+    ins = INSTRUMENTS[key]
+    INSTRUMENT, SCALE, NAME, STRIKE_STEP = key, ins["scale"], ins["short"], ins["step"]
+    LOT_SIZE = int(lot_size or ins["lot"])
+    for k, v in _BASE_POINTS.items():
+        val = v * SCALE
+        globals()[k] = int(round(val)) if isinstance(v, int) else val
+    if ins["exchange"] == "NSE":
+        URL_EXPIRIES = BASE + f"/api/option-chain-contract-info?symbol={ins['symbol']}"
+        URL_CHAIN = BASE + f"/api/option-chain-v3?type=Indices&symbol={ins['symbol']}&expiry={{expiry}}"
+        URL_CHART = (BASE + "/api/NextApi/apiClient/indexTrackerApi?functionName=getIndexChart&&index="
+                     + ins["chart_index"] + "&flag=1D")
+
+
+def make_client():
+    """Data client for the current instrument (NSE for Nifty / Bank Nifty, BSE for Sensex)."""
+    return BSEClient() if INSTRUMENTS[INSTRUMENT]["exchange"] == "BSE" else NSEClient()
+
 
 # --------------------------------------------------------------------------- data fetch
 class NSEClient:
@@ -159,6 +200,156 @@ class NSEClient:
             if row.get("index") == "INDIA VIX":
                 return float(row["last"])
         return None
+
+
+BSE_API = "https://api.bseindia.com/BseIndiaAPI/api"
+BSE_HEADERS = dict(HEADERS, Referer="https://www.bseindia.com/", Origin="https://www.bseindia.com")
+
+
+def _pick(d, *keys):
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return None
+
+
+def _num(v):
+    try:
+        return float(str(v).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+class BSEClient:
+    """Sensex options from BSE's website API, Sensex 1-minute prices from Yahoo Finance, VIX and holidays
+    from NSE. BSE does not document this API, so every field is looked up under several known names and
+    the raw reply is saved to bse_last_reply.json when it cannot be read (send that file to fix it)."""
+    DEBUG_PATH = None
+
+    def __init__(self):
+        self.s = requests.Session()
+        self.s.headers.update(BSE_HEADERS)
+        try:
+            self.s.get("https://www.bseindia.com/", timeout=15)
+        except requests.RequestException:
+            pass
+        self._nse = None
+
+    def nse(self):
+        if self._nse is None:
+            self._nse = NSEClient()
+        return self._nse
+
+    def get_json(self, url, tries=3):
+        last = None
+        for attempt in range(tries):
+            try:
+                r = self.s.get(url, timeout=20)
+                if r.status_code == 200:
+                    return r.json()
+                last = f"HTTP {r.status_code}"
+            except (requests.RequestException, ValueError) as e:
+                last = str(e)
+            time.sleep(2 + attempt * 3)
+        raise RuntimeError(f"BSE request failed ({last}): {url}")
+
+    def _dump(self, data):
+        if self.DEBUG_PATH:
+            try:
+                with open(self.DEBUG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=1, default=str)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _rows(data):
+        if isinstance(data, list):
+            return data
+        for k in ("Table", "Table1", "data", "Data"):
+            if isinstance(data.get(k), list) and data[k]:
+                return data[k]
+        return []
+
+    def expiries(self):
+        scrip = INSTRUMENTS[INSTRUMENT]["bse_scrip"]
+        data = self.get_json(f"{BSE_API}/ddlExpiry_IV/w?ProductType=IO&scrip_cd={scrip}")
+        out = []
+        for row in self._rows(data):
+            raw = _pick(row, "ExpiryDate", "Expiry", "expiry") if isinstance(row, dict) else row
+            for fmt in ("%d %b %Y", "%d-%b-%Y", "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y"):
+                try:
+                    out.append(dt.datetime.strptime(str(raw).strip(), fmt).strftime("%d-%b-%Y"))
+                    break
+                except ValueError:
+                    continue
+        if not out:
+            self._dump(data)
+            raise RuntimeError("could not read the Sensex expiry list from BSE (saved bse_last_reply.json)")
+        today = dt.datetime.now(IST).date()
+        out = sorted({d for d in out if dt.datetime.strptime(d, "%d-%b-%Y").date() >= today},
+                     key=lambda d: dt.datetime.strptime(d, "%d-%b-%Y"))
+        return out
+
+    def chain(self, expiry):
+        """BSE option chain, returned in NSE's shape so parse_chain() works unchanged."""
+        scrip = INSTRUMENTS[INSTRUMENT]["bse_scrip"]
+        e = dt.datetime.strptime(expiry, "%d-%b-%Y").strftime("%d %b %Y").replace(" ", "+")
+        data = self.get_json(f"{BSE_API}/DerivOptionChain_IV/w?Expiry={e}&scrip_cd={scrip}&strprice=0")
+        rows, spot = [], None
+        for r in self._rows(data):
+            if not isinstance(r, dict):
+                continue
+            k = _num(_pick(r, "Strike_Price1", "Strike_Price", "StrikePrice", "strikePrice", "STRIKE_PRICE"))
+            if not k:
+                continue
+            spot = spot or _num(_pick(r, "UlaValue", "UnderlyingValue", "Ula_Value", "underlyingValue")) or None
+            rows.append({"strikePrice": k, "CE": {
+                "openInterest": _num(_pick(r, "C_Open_Interest", "CE_OpenInterest", "C_OI", "CE_OI")),
+                "changeinOpenInterest": _num(_pick(r, "C_Absolute_Change_OI", "CE_ChgInOI", "C_Change_OI", "C_Chg_OI")),
+                "lastPrice": _num(_pick(r, "C_Last_Trd_Price", "C_LTP", "CE_LTP", "C_Ltp")),
+                "impliedVolatility": _num(_pick(r, "C_IV", "CE_IV")),
+                "totalTradedVolume": _num(_pick(r, "C_Vol_Traded", "CE_Volume", "C_Volume"))}, "PE": {
+                "openInterest": _num(_pick(r, "Open_Interest", "PE_OpenInterest", "P_Open_Interest", "PE_OI")),
+                "changeinOpenInterest": _num(_pick(r, "Absolute_Change_OI", "PE_ChgInOI", "P_Absolute_Change_OI")),
+                "lastPrice": _num(_pick(r, "Last_Trd_Price", "PE_LTP", "P_Last_Trd_Price", "P_LTP")),
+                "impliedVolatility": _num(_pick(r, "IV", "PE_IV", "P_IV")),
+                "totalTradedVolume": _num(_pick(r, "Vol_Traded", "PE_Volume", "P_Vol_Traded"))}})
+        if not spot and isinstance(data, dict):
+            for k in ("Table1", "Table2"):
+                for r in data.get(k) or []:
+                    spot = spot or _num(_pick(r, "UlaValue", "UnderlyingValue", "LTP", "CurrValue")) or None
+        oi = sum(x["CE"]["openInterest"] + x["PE"]["openInterest"] for x in rows)
+        if not rows or not spot or not oi:
+            self._dump(data)
+            raise RuntimeError("could not read the Sensex option chain from BSE (saved bse_last_reply.json)")
+        return {"records": {"data": rows, "underlyingValue": spot,
+                            "timestamp": dt.datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S")}}
+
+    def chart(self):
+        """Yahoo Finance 1-minute Sensex candles, returned in NSE's grapthData shape: each minute is fed as
+        open / high / low / close points stamped hh:mm:59 (IST wall clock), as minute_points() expects."""
+        sym = INSTRUMENTS[INSTRUMENT]["yahoo"]
+        r = self.s.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1m&range=1d",
+                       timeout=20, headers={"User-Agent": HEADERS["User-Agent"]})
+        if r.status_code != 200:
+            raise RuntimeError(f"Sensex prices: Yahoo Finance HTTP {r.status_code}")
+        res = r.json()["chart"]["result"][0]
+        q = res["indicators"]["quote"][0]
+        out = []
+        for i, ts in enumerate(res.get("timestamp") or []):
+            vals = [q[k][i] for k in ("open", "high", "low", "close")]
+            if any(v is None for v in vals):
+                continue
+            t = dt.datetime.fromtimestamp(ts, IST).replace(tzinfo=None, second=59, microsecond=0)
+            stamp = int(t.replace(tzinfo=dt.timezone.utc).timestamp() * 1000)
+            out += [[stamp, v, "NM"] for v in vals]
+        return {"grapthData": out}
+
+    def holidays(self):
+        return self.nse().holidays()
+
+    def vix(self):
+        return self.nse().vix()
 
 
 # --------------------------------------------------------------------------- calculations
@@ -366,10 +557,10 @@ def oi_levels(strikes, spot, prev_levels=None):
     # not jump 500 points to the next big strike every time Nifty dips a few points under a round number.
     if prev_levels:
         pR, pS = prev_levels.get("R"), prev_levels.get("S")
-        if pR in strikes and spot - LEVEL_STICKY <= pR <= spot + LEVEL_WINDOW + 100 \
+        if pR in strikes and spot - LEVEL_STICKY <= pR <= spot + LEVEL_WINDOW + 100 * SCALE \
                 and (R is None or strikes[R]["ce_oi"] < strikes[pR]["ce_oi"] * 1.10):
             R = pR
-        if pS in strikes and spot - LEVEL_WINDOW - 100 <= pS <= spot + LEVEL_STICKY \
+        if pS in strikes and spot - LEVEL_WINDOW - 100 * SCALE <= pS <= spot + LEVEL_STICKY \
                 and (S is None or strikes[S]["pe_oi"] < strikes[pS]["pe_oi"] * 1.10):
             S = pS
     return {"R": R, "S": S, "R_fresh": R2, "S_fresh": S2, "CE_fresh_near": Rf, "PE_fresh_near": Sf}
@@ -439,8 +630,8 @@ def option_idea(snap, opt, entry, stop, target):
     days = yrs * 365
     warn = " · expiry very near: premium decays fast, exit same day" if days < 1.5 else ""
     est = "" if live else " (est.)"
-    return (f"BUY NIFTY {exp} {k:,.0f} {opt} @ ~Rs {prem:,.1f}{est} | "
-            f"SL Rs {p_stop:,.1f} (Nifty {stop:,.0f}) | Target Rs {p_tgt:,.1f} (Nifty {target:,.0f}){warn}")
+    return (f"BUY {INSTRUMENT} {exp} {k:,.0f} {opt} @ ~Rs {prem:,.1f}{est} | "
+            f"SL Rs {p_stop:,.1f} ({NAME} {stop:,.0f}) | Target Rs {p_tgt:,.1f} ({NAME} {target:,.0f}){warn}")
 
 
 def option_premium(snap, k, opt):
@@ -691,7 +882,7 @@ def check_signals(prev, cur):
         elif pa["struct"] == ("down" if bull else "up") and not kind.startswith("REVERSAL"):
             pts -= 1
             why.append("structure against (" + ("LH/LL" if bull else "HH/HL") + ")")
-        tol = max(8, 0.5 * (atr or 0))
+        tol = max(8 * SCALE, 0.5 * (atr or 0))
         if kind in ("BREAKOUT", "BREAKDOWN", "OR BREAKOUT", "OR BREAKDOWN"):
             lvls = [x for x in ((pa["sh"], pa["or_high"]) if bull else (pa["sl"], pa["or_low"])) if x]
             cleared = [x for x in lvls if (c["close"] > x if bull else c["close"] < x)]
@@ -741,17 +932,17 @@ def check_signals(prev, cur):
 
     def next_below(x):
         """nearest strike below x whose put OI is at least 60% of the biggest put OI nearby"""
-        cands = [k for k in st_prev if x - LEVEL_WINDOW <= k < x - 40]
+        cands = [k for k in st_prev if x - LEVEL_WINDOW <= k < x - 40 * SCALE]
         if not cands:
-            return round(x - 100, -1)
+            return round(x - 100 * SCALE, -1)
         top = max(st_prev[k]["pe_oi"] for k in cands)
         return max(k for k in cands if st_prev[k]["pe_oi"] >= 0.6 * top)
 
     def next_above(x):
         """nearest strike above x whose call OI is at least 60% of the biggest call OI nearby"""
-        cands = [k for k in st_prev if x + 40 < k <= x + LEVEL_WINDOW]
+        cands = [k for k in st_prev if x + 40 * SCALE < k <= x + LEVEL_WINDOW]
         if not cands:
-            return round(x + 100, -1)
+            return round(x + 100 * SCALE, -1)
         top = max(st_prev[k]["ce_oi"] for k in cands)
         return min(k for k in cands if st_prev[k]["ce_oi"] >= 0.6 * top)
 
@@ -775,7 +966,7 @@ def check_signals(prev, cur):
         if rr < MIN_RR:
             return (f"Skip: reward:risk {rr:.1f} below {MIN_RR} (target {tgt:,.0f}, stop {stp:,.0f})", "", None)
         side, opt = ("short", "PE") if direction == "bearish" else ("long", "CE")
-        txt = (f"Nifty {side}: entry ~{entry:,.0f}, stop {stp:,.0f}, target {tgt:,.0f} "
+        txt = (f"{NAME} {side}: entry ~{entry:,.0f}, stop {stp:,.0f}, target {tgt:,.0f} "
                f"(risk {risk:.0f} / reward {reward:.0f} pts, R:R {rr:.1f}{capped})")
         return txt, option_idea(cur, opt, entry, stp, tgt), trade_plan(cur, direction, entry, stp, tgt)
 
@@ -879,7 +1070,7 @@ def check_signals(prev, cur):
     # 3: rejection at resistance
     R = lv.get("R")
     for Rk in {R, lv.get("CE_fresh_near")}:
-        if Rk and Rk > pc["close"] and c["high"] >= Rk - 10 and c["close"] < Rk - 15 and c["close"] < c["open"]:
+        if Rk and Rk > pc["close"] and c["high"] >= Rk - 10 * SCALE and c["close"] < Rk - 15 * SCALE and c["close"] < c["open"]:
             add("REJECTION", "bearish",
                 f"Tested resistance {Rk:,.0f} (high {c['high']:,.2f}) and closed red at {c['close']:,.2f}; "
                 f"call OI there {d_oi(Rk, 'ce'):+,.0f}", f"Resistance holding - avoid longs below {Rk:,.0f}", Rk)
@@ -887,7 +1078,7 @@ def check_signals(prev, cur):
     # 4: bounce at support
     S = lv.get("S")
     for Sk in {S, lv.get("PE_fresh_near")}:
-        if Sk and Sk < pc["close"] and c["low"] <= Sk + 10 and c["close"] > Sk + 15 and c["close"] > c["open"]:
+        if Sk and Sk < pc["close"] and c["low"] <= Sk + 10 * SCALE and c["close"] > Sk + 15 * SCALE and c["close"] > c["open"]:
             add("BOUNCE", "bullish",
                 f"Tested support {Sk:,.0f} (low {c['low']:,.2f}) and closed green at {c['close']:,.2f}; "
                 f"put OI there {d_oi(Sk, 'pe'):+,.0f}", f"Support holding - avoid shorts above {Sk:,.0f}", Sk)
@@ -897,16 +1088,16 @@ def check_signals(prev, cur):
     dce_t, dpe_t = cur["tce"] - prev["tce"], cur["tpe"] - prev["tpe"]
     if abs(move) >= PRICE_MOVE_MIN and not estimated and not expiry_eve:
         if move > 0 and dce_t <= -FLOW_THRESHOLD:
-            add("SHORT COVERING", "bullish", f"Nifty {move:+.0f} pts while total call OI {dce_t:+,.0f}",
+            add("SHORT COVERING", "bullish", f"{NAME} {move:+.0f} pts while total call OI {dce_t:+,.0f}",
                 "Call writers exiting - upside can accelerate")
         if move > 0 and dpe_t >= FLOW_THRESHOLD:
-            add("PUT WRITING", "bullish", f"Nifty {move:+.0f} pts with total put OI {dpe_t:+,.0f}",
+            add("PUT WRITING", "bullish", f"{NAME} {move:+.0f} pts with total put OI {dpe_t:+,.0f}",
                 "Fresh support being built")
         if move < 0 and dpe_t <= -FLOW_THRESHOLD:
-            add("PUT UNWINDING", "bearish", f"Nifty {move:+.0f} pts while total put OI {dpe_t:+,.0f}",
+            add("PUT UNWINDING", "bearish", f"{NAME} {move:+.0f} pts while total put OI {dpe_t:+,.0f}",
                 "Put writers exiting - supports weakening")
         if move < 0 and dce_t >= FLOW_THRESHOLD:
-            add("CALL WRITING", "bearish", f"Nifty {move:+.0f} pts with total call OI {dce_t:+,.0f}",
+            add("CALL WRITING", "bearish", f"{NAME} {move:+.0f} pts with total call OI {dce_t:+,.0f}",
                 "Fresh resistance being built")
 
     # 6: PCR regime change
@@ -1084,7 +1275,7 @@ def _svg_candles(snaps):
     n = max(len(candles), 75)  # full day = 75 candles
     cw = (W - L - Rm) / n
     y = lambda p: T + (hi - p) / (hi - lo) * (H - T - B)
-    out = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="Nifty 5-minute candles">']
+    out = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="{NAME} 5-minute candles">']
     step = 10 ** math.floor(math.log10(max(1, (hi - lo) / 5)))
     step = step * (5 if (hi - lo) / step > 25 else 2 if (hi - lo) / step > 10 else 1)
     g = math.ceil(lo / step) * step
@@ -1207,7 +1398,7 @@ def render_dashboard(snaps, signals, status=""):
         b = bias(last["pcr"])
         lv = last["levels"]
         tiles = "".join([
-            tile("Nifty (5-min close)", f'{c["close"]:,.2f}', f'{chg:+,.2f} since open · {last["time"]:%H:%M}'),
+            tile(f"{NAME} (5-min close)", f'{c["close"]:,.2f}', f'{chg:+,.2f} since open · {last["time"]:%H:%M}'),
             tile("PCR", f'{last["pcr"]:.2f}' if last["pcr"] else "-", f'Bias: <b class="{b}">{b}</b>'),
             tile("Today's change PCR", f'{last["chg_pcr"]:.2f}' if last["chg_pcr"] else "-",
                  "new puts ÷ new calls"),
@@ -1251,7 +1442,7 @@ def render_dashboard(snaps, signals, status=""):
 
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60">
-<title>Nifty OI Tracker</title>
+<title>{INSTRUMENTS[INSTRUMENT]['label']} OI Tracker</title>
 <style>
 :root{{--bg:#fcfcfb;--card:#ffffff;--ink:#0b0b0b;--ink2:#52514e;--line:#e6e5e1;--up:#1a9e6e;--dn:#d63b3a;--warn:#c98500;--atm:#eef4fd}}
 @media (prefers-color-scheme:dark){{:root{{--bg:#1a1a19;--card:#232322;--ink:#fff;--ink2:#c3c2b7;--line:#3a3a38;--up:#2fbf86;--dn:#e66767;--warn:#eda100;--atm:#22324a}}}}
@@ -1272,8 +1463,8 @@ td.bar.l span{{right:8px;background:var(--dn)}}td.bar.r span{{left:8px;backgroun
 .status{{margin-top:10px;padding:8px 12px;border-radius:8px;background:var(--atm);font-weight:600}}
 footer{{margin-top:24px;font-size:12px;color:var(--ink2)}}
 </style></head><body><main>
-<h1>Nifty 50 · OI Tracker</h1>
-<div class="muted">Updated {now} IST · page refreshes every 60 s · {len(snaps)} snapshots · data: NSE India</div>
+<h1>{INSTRUMENTS[INSTRUMENT]['label']} · OI Tracker</h1>
+<div class="muted">Updated {now} IST · page refreshes every 60 s · {len(snaps)} snapshots · data: {INSTRUMENTS[INSTRUMENT]['exchange']} India</div>
 {f'<div class="status">{html.escape(status)}</div>' if status else ''}
 <div class="tiles">{tiles}</div>
 <h2>Scorecard - did the suggestions work?</h2><div class="card">{_money_line_html(signals)}{_score_html(signals)}</div>
@@ -1403,7 +1594,7 @@ def iter_replay(out, expiry=None, client=None):
     candle is ESTIMATED by moving in a straight line from the morning OI (close OI minus the
     day's change) to the closing OI. VIX is held at its latest value."""
     yield ("info", "Downloading the latest session from NSE ...")
-    client = client or NSEClient()
+    client = client or make_client()
     expiry = expiry or client.expiries()[0]
     pts = minute_points(client.chart())
     candles = five_min_candles(pts)
@@ -1576,7 +1767,7 @@ def iter_live(out, expiry=None, client=None, stop=None, once=False):
     stop = stop or threading.Event()
     yield ("info", "Connecting to NSE ...")
     try:
-        client = client or NSEClient()
+        client = client or make_client()
         expiry = expiry or client.expiries()[0]
     except Exception as e:
         yield ("error", f"Could not reach NSE ({e}). Check your internet connection and try again.")

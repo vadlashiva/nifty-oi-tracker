@@ -71,7 +71,8 @@ TUNABLES = [
 DEFAULTS = {
     "data_dir": os.path.join(app_dir(), "nifty_tracker_data"),
     "theme": "auto", "sound": True, "notify": True, "notify_all": False, "autostart": False,
-    "lots": engine.LOTS, "lot_size": engine.LOT_SIZE, "brokerage": engine.BROKERAGE_PER_ORDER,
+    "lots": engine.LOTS, "brokerage": engine.BROKERAGE_PER_ORDER, "instrument": "NIFTY",
+    "lot_sizes": {k: v["lot"] for k, v in engine.INSTRUMENTS.items()},
     "tunables": {k: getattr(engine, k) for k, *_ in TUNABLES},
 }
 
@@ -81,7 +82,12 @@ def load_settings():
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as f:
             saved = json.load(f)
-        s.update({k: v for k, v in saved.items() if k != "tunables"})
+        s.update({k: v for k, v in saved.items() if k not in ("tunables", "lot_sizes")})
+        s["lot_sizes"].update(saved.get("lot_sizes", {}))
+        if "lot_size" in saved and "lot_sizes" not in saved:      # settings from before Bank Nifty / Sensex
+            s["lot_sizes"]["NIFTY"] = saved["lot_size"]
+        if s.get("instrument") not in engine.INSTRUMENTS:
+            s["instrument"] = "NIFTY"
         s["tunables"].update({k: v for k, v in saved.get("tunables", {}).items() if k in s["tunables"]})
     except (OSError, ValueError):
         pass
@@ -97,15 +103,27 @@ def save_settings(s):
 
 
 def apply_tunables(s):
+    """Index first (it rescales point rules), then the user's rules - point values are entered in Nifty
+    points and stretched for Bank Nifty / Sensex - then position size."""
+    engine.set_instrument(s["instrument"])
     for k, v in s["tunables"].items():
+        if k in engine.POINT_TUNABLES:
+            v = type(v)(round(v * engine.SCALE)) if isinstance(v, int) else v * engine.SCALE
         setattr(engine, k, v)
     apply_money(s)
+
+
+def data_root(s):
+    """Nifty keeps the original data folder; the other indices get a sub-folder each."""
+    sym = s.get("instrument", "NIFTY")
+    return s["data_dir"] if sym == "NIFTY" else os.path.join(s["data_dir"], sym)
 
 
 def apply_money(s):
     """Position size and costs used for the 'profit if you had taken every idea' figures."""
     engine.LOTS = max(1, int(s.get("lots", engine.LOTS)))
-    engine.LOT_SIZE = max(1, int(s.get("lot_size", engine.LOT_SIZE)))
+    sym = s.get("instrument", "NIFTY")
+    engine.LOT_SIZE = max(1, int(s.get("lot_sizes", {}).get(sym, engine.INSTRUMENTS[sym]["lot"])))
     engine.BROKERAGE_PER_ORDER = max(0.0, float(s.get("brokerage", engine.BROKERAGE_PER_ORDER)))
 
 
@@ -277,18 +295,18 @@ class Worker(QThread):
 
 class ExpiryLoader(QObject):
     """Fetches the expiry list in a daemon thread (never blocks the window or its closing)."""
-    loaded = Signal(list)
+    loaded = Signal(str, list)
 
     def start(self):
-        threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._run, args=(engine.INSTRUMENT,), daemon=True).start()
 
-    def _run(self):
+    def _run(self, sym):
         try:
-            items = list(engine.NSEClient().expiries())[:8]
+            items = list(engine.make_client().expiries())[:8]
         except Exception:
             items = []
         try:
-            self.loaded.emit(items)
+            self.loaded.emit(sym, items)
         except RuntimeError:
             pass
 
@@ -1247,9 +1265,12 @@ class SettingsDialog(QDialog):
         fl.addRow("Lots per idea", self.lots)
         self.lot_size = QSpinBox()
         self.lot_size.setRange(1, 1000)
-        self.lot_size.setValue(int(self.s.get("lot_size", 65)))
-        self.lot_size.setToolTip("Units per Nifty lot (65 from Jan 2026). Change only if NSE revises it.")
-        fl.addRow("Lot size (units)", self.lot_size)
+        sym = self.s.get("instrument", "NIFTY")
+        ins = engine.INSTRUMENTS[sym]
+        self.lot_size.setValue(int(self.s["lot_sizes"].get(sym, ins["lot"])))
+        self.lot_size.setToolTip(f"Units per {ins['label']} lot ({ins['lot']} at the time of writing). "
+                                 f"Change only if the exchange revises it.")
+        fl.addRow(f"Lot size – {ins['label']}", self.lot_size)
         self.brokerage = QDoubleSpinBox()
         self.brokerage.setRange(0, 500)
         self.brokerage.setDecimals(0)
@@ -1321,7 +1342,8 @@ class SettingsDialog(QDialog):
         s["theme"] = self.theme.currentText()
         s["sound"], s["notify"] = self.sound.isChecked(), self.notify.isChecked()
         s["notify_all"], s["autostart"] = self.notify_all.isChecked(), self.autostart.isChecked()
-        s["lots"], s["lot_size"], s["brokerage"] = self.lots.value(), self.lot_size.value(), self.brokerage.value()
+        s["lots"], s["brokerage"] = self.lots.value(), self.brokerage.value()
+        s["lot_sizes"][s.get("instrument", "NIFTY")] = self.lot_size.value()
         for key, (w, typ) in self.inputs.items():
             s["tunables"][key] = w.currentText() if typ is str else typ(w.value())
         return s
@@ -1334,6 +1356,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
+        apply_tunables(self.settings)
         apply_money(self.settings)
         self.worker, self.rec, self.next_wait = None, None, None
         self.running_mode, self.had_error = "", False
@@ -1351,6 +1374,7 @@ class MainWindow(QMainWindow):
             self.tray.show()
         self.build()
         self.build_shortcuts()
+        self.update_index_labels()
         self.apply_theme()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -1376,7 +1400,7 @@ class MainWindow(QMainWindow):
         h.setSpacing(10)
         tb = QVBoxLayout()
         tb.setSpacing(0)
-        title = QLabel("Nifty 50 · OI Tracker")
+        self.title = title = QLabel("Nifty 50 · OI Tracker")
         title.setObjectName("title")
         self.subtitle = QLabel("Open interest + price action, every 5 minutes")
         self.subtitle.setObjectName("muted")
@@ -1388,6 +1412,16 @@ class MainWindow(QMainWindow):
         self.pill.setObjectName("pill")
         h.addWidget(self.pill)
         h.addStretch()
+        self.index_box = QComboBox()
+        self.index_keys = list(engine.INSTRUMENTS)
+        for k in self.index_keys:
+            self.index_box.addItem(engine.INSTRUMENTS[k]["label"])
+        self.index_box.setCurrentIndex(self.index_keys.index(self.settings["instrument"]))
+        self.index_box.setToolTip("Index to track. Nifty and Bank Nifty use NSE data; Sensex uses BSE "
+                                  "(options) and Yahoo Finance (1-minute prices).\n"
+                                  "Each index keeps its own data folder.")
+        self.index_box.currentIndexChanged.connect(self.change_index)
+        h.addWidget(self.index_box)
         self.mode = QComboBox()
         for _, label in self.MODES:
             self.mode.addItem(label)
@@ -1516,7 +1550,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.status_folder, 1)
         self.statusBar().addPermanentWidget(self.status_upd)
         self.statusBar().addPermanentWidget(QLabel("Educational tool – not trading advice  "))
-        self.status_folder.setText(f"Data folder: {self.settings['data_dir']}")
+        self.status_folder.setText(f"Data folder: {data_root(self.settings)}")
 
     def build_scorecard(self):
         w = QWidget()
@@ -1616,17 +1650,18 @@ class MainWindow(QMainWindow):
         folder = None
         if mode == "retest":
             folder = QFileDialog.getExistingDirectory(self, "Choose a day recorded in live mode",
-                                                      self.settings["data_dir"])
+                                                      data_root(self.settings))
             if not folder:
                 return
         apply_tunables(self.settings)
-        os.makedirs(self.settings["data_dir"], exist_ok=True)
+        os.makedirs(data_root(self.settings), exist_ok=True)
+        engine.BSEClient.DEBUG_PATH = os.path.join(data_root(self.settings), "bse_last_reply.json")
         expiry = self.expiry.currentText() if self.expiry.currentIndex() > 0 else None
         self.snaps, self.signals, self.rec, self.next_wait = [], [], None, None
         self.select_signal(None)
         self.chart.empty_text = "Connecting to NSE…" if mode != "retest" else "Loading…"
         self.refresh_all()
-        self.worker = Worker(mode, self.settings["data_dir"], expiry, folder, self.settings["sound"])
+        self.worker = Worker(mode, data_root(self.settings), expiry, folder, self.settings["sound"])
         self.worker.info.connect(lambda t: self.log_line(t))
         self.worker.error.connect(self.on_error)
         self.worker.started_rec.connect(self.on_started)
@@ -1650,6 +1685,7 @@ class MainWindow(QMainWindow):
         self.start_btn.style().unpolish(self.start_btn)
         self.start_btn.style().polish(self.start_btn)
         self.mode.setEnabled(not on)
+        self.index_box.setEnabled(not on)
         self.expiry.setEnabled(not on)
         if on:
             self.pill_set("Working…", T["accent"])
@@ -1659,7 +1695,7 @@ class MainWindow(QMainWindow):
         self.pill.setStyleSheet(f"color:{color};")
 
     def open_folder(self):
-        path = self.rec.folder if self.rec else self.settings["data_dir"]
+        path = self.rec.folder if self.rec else data_root(self.settings)
         os.makedirs(path, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
@@ -1675,7 +1711,7 @@ class MainWindow(QMainWindow):
             self.settings = dlg.result_settings()
             save_settings(self.settings)
             apply_money(self.settings)
-            self.status_folder.setText(f"Data folder: {self.settings['data_dir']}")
+            self.status_folder.setText(f"Data folder: {data_root(self.settings)}")
             self.apply_theme()
             if self.worker and self.worker.isRunning():
                 self.log_line("Settings saved - rule changes apply from the next Start.")
@@ -1775,9 +1811,44 @@ class MainWindow(QMainWindow):
             self.tray.hide()
         e.accept()
 
-    def on_expiries(self, items):
+    def on_expiries(self, sym, items):
+        if sym != self.settings["instrument"]:
+            return                                  # list for an index the user has since switched away from
+        while self.expiry.count() > 1:
+            self.expiry.removeItem(1)
         for x in items:
             self.expiry.addItem(x)
+
+    # ---- index choice
+    def update_index_labels(self):
+        ins = engine.INSTRUMENTS[self.settings["instrument"]]
+        self.title.setText(f"{ins['label']} · OI Tracker")
+        self.setWindowTitle(f"{APP_NAME} – {ins['label']}")
+        self.tiles["nifty"].l.setText(f"{ins['short']} (5-min close)")
+        self.status_folder.setText(f"Data folder: {data_root(self.settings)}")
+
+    def change_index(self, i):
+        sym = self.index_keys[i]
+        if sym == self.settings["instrument"] or (self.worker and self.worker.isRunning()):
+            return
+        self.settings["instrument"] = sym
+        save_settings(self.settings)
+        apply_tunables(self.settings)
+        self.snaps, self.signals, self.rec, self.next_wait = [], [], None, None
+        self.select_signal(None)
+        while self.expiry.count() > 1:
+            self.expiry.removeItem(1)
+        self.expiry.setCurrentIndex(0)
+        self.expiry_loader.start()
+        self.subtitle.setText("Open interest + price action, every 5 minutes")
+        self.chart.empty_text = "Press Start to begin."
+        self.pill_set("Ready", T["ink2"])
+        self.update_index_labels()
+        self.refresh_all()
+        note = (" Sensex options come from BSE and its 1-minute prices from Yahoo Finance."
+                if engine.INSTRUMENTS[sym]["exchange"] == "BSE" else "")
+        self.log_line(f"Switched to {engine.INSTRUMENTS[sym]['label']} (lot {engine.LOT_SIZE}, strikes every "
+                      f"{engine.STRIKE_STEP}, point rules ×{engine.SCALE:g}).{note}")
 
     # ---- interaction
     def build_shortcuts(self):
@@ -1845,6 +1916,8 @@ class MainWindow(QMainWindow):
         if len(hist) < 2:
             return
         title, fmt, _ = self.TILE_HIST[key]
+        if key == "nifty":
+            title = f"{engine.NAME} 5-min close"
         series = [(title, T["accent"], hist)]
         if key == "nifty":
             series += [("Max call OI", T["dn"], self.tile_history("res")), ("Max put OI", T["up"], self.tile_history("sup"))]
@@ -2004,8 +2077,8 @@ class MainWindow(QMainWindow):
                      f"{p['prem']:,.1f}", f"{x['exit_prem']:,.1f}" if x.get("exit_prem") is not None else "–",
                      x["status"] + (f" {x['exit_time']:%H:%M}" if x["exit_time"] and "15:30" not in x["status"] else ""),
                      str(m["qty"]) if m else "–", f"₹{m['charges']:,.0f}" if m else "–", rs(net) if m else "–"]
-            tip = (f"{sg['kind']} · Nifty entry {p['entry']:,.0f}, stop {p['stop']:,.0f}, target {p['target']:,.0f} · "
-                   f"{x['points']:+,.0f} Nifty pts" + (f" · invested {rs(m['buy'], sign=False)}" if m else ""))
+            tip = (f"{sg['kind']} · {engine.NAME} entry {p['entry']:,.0f}, stop {p['stop']:,.0f}, target {p['target']:,.0f} · "
+                   f"{x['points']:+,.0f} {engine.NAME} pts" + (f" · invested {rs(m['buy'], sign=False)}" if m else ""))
             for c, text in enumerate(cells):
                 it = QTableWidgetItem(text)
                 it.setToolTip(tip if not (x["status"] == "OPEN" and c in (5, 8)) else "Still running – value if you closed it now")
@@ -2023,7 +2096,7 @@ class MainWindow(QMainWindow):
 
     def refresh_history(self):
         cur = os.path.basename(self.rec.folder) if self.rec else None
-        rows = engine.history_pnl(self.settings["data_dir"], exclude=cur)
+        rows = engine.history_pnl(data_root(self.settings), exclude=cur)
         self.history.setRowCount(len(rows) + (1 if rows else 0))
         tot = [0, 0, 0.0]
         for r, (d, n, w, net) in enumerate(rows):
