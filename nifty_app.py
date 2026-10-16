@@ -1685,7 +1685,6 @@ class MainWindow(QMainWindow):
         self.start_btn.style().unpolish(self.start_btn)
         self.start_btn.style().polish(self.start_btn)
         self.mode.setEnabled(not on)
-        self.index_box.setEnabled(not on)
         self.expiry.setEnabled(not on)
         if on:
             self.pill_set("Working…", T["accent"])
@@ -1829,8 +1828,24 @@ class MainWindow(QMainWindow):
 
     def change_index(self, i):
         sym = self.index_keys[i]
-        if sym == self.settings["instrument"] or (self.worker and self.worker.isRunning()):
+        if sym == self.settings["instrument"]:
             return
+        if self.worker and self.worker.isRunning():
+            name = engine.INSTRUMENTS[sym]["label"]
+            cur = engine.INSTRUMENTS[self.settings["instrument"]]["label"]
+            if QMessageBox.question(self, APP_NAME, f"{cur} tracking is running.\n\nStop it and switch to {name}? "
+                                    f"(Press Start afterwards to track {name}.)") != QMessageBox.Yes:
+                self.index_box.blockSignals(True)
+                self.index_box.setCurrentIndex(self.index_keys.index(self.settings["instrument"]))
+                self.index_box.blockSignals(False)
+                return
+            self.worker.stop()
+            for sig in (self.worker.snap, self.worker.started_rec, self.worker.done):
+                try:
+                    sig.disconnect()             # nothing from the old index may land in the new view
+                except (RuntimeError, TypeError):
+                    pass
+            self.worker.wait(5000)
         self.settings["instrument"] = sym
         save_settings(self.settings)
         apply_tunables(self.settings)
