@@ -57,6 +57,9 @@ FRESH_WINDOW = 300           # look for fresh OI build-up within +/- this many p
 FLOW_THRESHOLD = 20000       # contracts: min change in total CE/PE OI to flag an OI-flow signal
 PRICE_MOVE_MIN = 10          # points: min 5-min move for OI-flow classification
 STOP_BUFFER = 25             # points beyond a level for the stop-loss
+LOT_SIZE = 65                # Nifty contract size (units per lot) - NSE revised it to 65 from Jan 2026
+LOTS = 1                     # lots per idea for the "if you had taken it" profit in Rs
+BROKERAGE_PER_ORDER = 20.0   # Rs per executed order (typical discount broker)
 DEFAULT_IV = 13.0            # % used when NSE shows no IV for a strike
 VIX_JUMP_PCT = 3.0           # % rise in VIX between snapshots that triggers a caution flag
 BREAK_MIN = 10               # points: a 5-min close must be at least this far through a level to count as a break
@@ -504,9 +507,86 @@ def evaluate_trades(snaps, signals):
             opt_pnl = px - p["prem"]
         results.append({"sig": sig, "status": status, "exit_time": exit_snap["time"] if exit_snap else None,
                         "points": pts, "best": best, "worst": worst, "opt_pnl": opt_pnl,
-                        "opt_real": p["prem_real"]})
+                        "opt_real": p["prem_real"],
+                        "exit_prem": (p["prem"] + opt_pnl) if opt_pnl is not None else None,
+                        "money": money(p["prem"], p["prem"] + opt_pnl) if opt_pnl is not None else None})
         sig["result"] = results[-1]
     return results
+
+
+def trade_charges(buy_value, sell_value):
+    """Approximate Indian option-buying charges for one round trip (buy + sell), in Rs."""
+    brokerage = 2 * BROKERAGE_PER_ORDER
+    stt = 0.001 * sell_value                       # 0.1% on sell-side premium
+    exch = 0.0003503 * (buy_value + sell_value)    # NSE transaction charges
+    sebi = 10e-7 * (buy_value + sell_value)        # Rs 10 per crore
+    stamp = 0.00003 * buy_value                    # 0.003% on the buy side
+    gst = 0.18 * (brokerage + exch + sebi)
+    return brokerage + stt + exch + sebi + stamp + gst
+
+
+def money(entry_prem, exit_prem, lots=None, lot_size=None):
+    """Rs result of buying `lots` x `lot_size` units at entry_prem and selling at exit_prem."""
+    qty = (lots or LOTS) * (lot_size or LOT_SIZE)
+    buy, sell = entry_prem * qty, max(0.0, exit_prem) * qty
+    ch = trade_charges(buy, sell)
+    return {"qty": qty, "buy": buy, "sell": sell, "gross": sell - buy, "charges": ch, "net": sell - buy - ch}
+
+
+def money_summary(results):
+    """Totals in Rs for the 'if you had taken every idea' view."""
+    rs = [r for r in results if r.get("money")]
+    closed = [r for r in rs if r["status"] != "OPEN"]
+    opened = [r for r in rs if r["status"] == "OPEN"]
+    curve, cum = [], 0.0
+    for r in sorted(closed, key=lambda r: r["exit_time"] or r["sig"]["time"]):
+        cum += r["money"]["net"]
+        curve.append((r["exit_time"] or r["sig"]["time"], cum))
+    return {"net": sum(r["money"]["net"] for r in closed),
+            "open": sum(r["money"]["net"] for r in opened),
+            "n_closed": len(closed), "n_open": len(opened),
+            "wins": sum(1 for r in closed if r["money"]["net"] > 0),
+            "grade_a": sum(r["money"]["net"] for r in closed if r["sig"].get("grade") == "A"),
+            "charges": sum(r["money"]["charges"] for r in closed),
+            "capital": max((r["money"]["buy"] for r in rs), default=0.0),
+            "best": max((r["money"]["net"] for r in rs), default=0.0),
+            "worst": min((r["money"]["net"] for r in rs), default=0.0),
+            "curve": curve}
+
+
+def history_pnl(data_dir, exclude=None):
+    """Net Rs per previous LIVE day (folders named YYYY-MM-DD; replay/re-test folders are skipped).
+    Older files without Rs columns are converted from option P&L per unit at the current lot settings."""
+    rows = []
+    try:
+        names = sorted(os.listdir(data_dir))
+    except OSError:
+        return rows
+    for d in names:
+        if d == exclude or len(d) != 10 or not d[:4].isdigit() or not os.path.isdir(os.path.join(data_dir, d)):
+            continue
+        f = os.path.join(data_dir, d, "results.csv")
+        if not os.path.exists(f):
+            continue
+        try:
+            with open(f, newline="", encoding=CSV_ENCODING) as fh:
+                recs = list(csv.DictReader(fh))
+        except (OSError, ValueError):
+            continue
+        n = w = 0
+        net = 0.0
+        for r in recs:
+            if r.get("result") in (None, "", "OPEN"):
+                continue
+            try:
+                entry, unit = float(r["option_entry"]), float(r["option_pnl_per_unit"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            v = money(entry, entry + unit)["net"]
+            n, w, net = n + 1, w + (v > 0), net + v
+        if n:
+            rows.append((d, n, w, net))
+    return rows
 
 
 def scorecard(results):
@@ -961,7 +1041,8 @@ class Recorder:
             w = csv.writer(buf)
             w.writerow(["signal_time", "signal", "grade", "nifty_entry", "stop", "target", "option", "option_entry",
                         "result", "exit_time", "nifty_points", "best_move", "worst_move", "option_pnl_per_unit",
-                        "option_prices"])
+                        "option_prices", "option_exit", "quantity", "invested_rs", "gross_rs", "charges_rs",
+                        "net_rs"])
             for r in results:
                 p, sg = r["sig"]["plan"], r["sig"]
                 w.writerow([f'{sg["time"]:%H:%M}', sg["kind"], sg.get("grade", ""), round(p["entry"], 2), p["stop"],
@@ -969,7 +1050,11 @@ class Recorder:
                             f'{r["exit_time"]:%H:%M}' if r["exit_time"] else "", round(r["points"], 2),
                             round(r["best"], 2), round(r["worst"], 2),
                             round(r["opt_pnl"], 2) if r["opt_pnl"] is not None else "",
-                            "real LTP" if r["opt_real"] else "estimated"])
+                            "real LTP" if r["opt_real"] else "estimated",
+                            round(r["exit_prem"], 2) if r.get("exit_prem") is not None else "",
+                            *([r["money"]["qty"], round(r["money"]["buy"], 2), round(r["money"]["gross"], 2),
+                               round(r["money"]["charges"], 2), round(r["money"]["net"], 2)]
+                              if r.get("money") else ["", "", "", "", ""])])
         self._safe_write(os.path.join(self.folder, "results.csv"), buf.getvalue(), CSV_ENCODING)
         self._safe_write(self.dash_path, render_dashboard(self.snaps, self.signals, self.status))
 
@@ -1065,6 +1150,19 @@ def _result_html(sig):
         opt = f'<div class="muted">Option {r["opt_pnl"]:+,.1f} Rs/unit{"" if r["opt_real"] else " est."}</div>'
     return (f'<b class="{cls}">{r["status"]}</b>{when}<div>{r["points"]:+,.0f} Nifty pts</div>'
             f'<div class="muted">best +{r["best"]:,.0f} / worst -{r["worst"]:,.0f}</div>{opt}')
+
+
+def _money_line_html(signals):
+    res = [s["result"] for s in signals if s.get("result")]
+    if not res:
+        return ""
+    ms = money_summary(res)
+    col = "bullish" if ms["net"] > 0 else "bearish" if ms["net"] < 0 else ""
+    open_txt = f', open trades Rs {ms["open"]:+,.0f}' if ms["n_open"] else ""
+    return (f'<p style="margin:0 0 10px;font-size:15px">If you had taken every idea ({LOTS} lot = '
+            f'{LOTS * LOT_SIZE} qty): <b class="{col}">Rs {ms["net"]:+,.0f}</b> net after approx. charges '
+            f'({ms["n_closed"]} closed, {ms["wins"]} profitable{open_txt}) '
+            f'· Grade A only Rs {ms["grade_a"]:+,.0f}</p>')
 
 
 def _score_html(signals):
@@ -1178,7 +1276,7 @@ footer{{margin-top:24px;font-size:12px;color:var(--ink2)}}
 <div class="muted">Updated {now} IST · page refreshes every 60 s · {len(snaps)} snapshots · data: NSE India</div>
 {f'<div class="status">{html.escape(status)}</div>' if status else ''}
 <div class="tiles">{tiles}</div>
-<h2>Scorecard - did the suggestions work?</h2><div class="card">{_score_html(signals)}</div>
+<h2>Scorecard - did the suggestions work?</h2><div class="card">{_money_line_html(signals)}{_score_html(signals)}</div>
 <h2>5-minute candles with OI levels</h2><div class="card">{_svg_candles(snaps)}</div>
 <h2>Signals (newest first)</h2><div class="card"><table><thead><tr><th>Time</th><th>Signal</th><th>Price</th>
 <th>Details</th><th>Trade idea</th><th>Bias</th><th>Result</th></tr></thead><tbody>{sig_rows}</tbody></table></div>
@@ -1206,12 +1304,14 @@ def print_scorecard(rec):
         sg, p = r["sig"], r["sig"]["plan"]
         when = f' at {r["exit_time"]:%H:%M}' if r["exit_time"] else ""
         opt = f' | option {r["opt_pnl"]:+.1f} Rs/unit' if r["opt_pnl"] is not None else ""
+        rs = f' | net Rs {r["money"]["net"]:+,.0f} on {r["money"]["qty"]} qty' if r.get("money") else ""
         print(f'  {sg["time"]:%H:%M} [Grade {sg.get("grade", "-")}] {sg["kind"]} {p["strike"]:.0f} {p["opt"]}: '
-              f'{r["status"]}{when} -> {r["points"]:+.0f} Nifty pts{opt}')
+              f'{r["status"]}{when} -> {r["points"]:+.0f} Nifty pts{opt}{rs}')
     sc = scorecard(res)
     wr = f'{sc["win_rate"]:.0f}%' if sc["win_rate"] is not None else "-"
-    print(f'  Total: {sc["wins"]}/{sc["closed"]} won ({wr}), net {sc["points"]:+.0f} Nifty pts. '
-          f'Details: results.csv')
+    ms = money_summary(res)
+    print(f'  Total: {sc["wins"]}/{sc["closed"]} won ({wr}), net {sc["points"]:+.0f} Nifty pts, '
+          f'net profit Rs {ms["net"]:+,.0f} ({LOTS} lot x {LOT_SIZE}, after approx. charges). Details: results.csv')
 
 
 def beep(kind):
@@ -1591,6 +1691,7 @@ def run(args):
 
 
 def main():
+    global LOTS, LOT_SIZE, BROKERAGE_PER_ORDER
     if os.name == "nt":
         os.system("")  # enable ANSI colours in the Windows console
     p = argparse.ArgumentParser(description="Nifty 50 OI tracker (5-minute)")
@@ -1601,10 +1702,15 @@ def main():
                    help="re-test the rules on a day recorded by live mode, e.g. nifty_tracker_data/2026-10-05")
     p.add_argument("--expiry", help="expiry date like 06-Oct-2026 (default: nearest)")
     p.add_argument("--no-beep", action="store_true")
+    p.add_argument("--lots", type=int, default=LOTS, help="lots per idea for the profit in Rs (default 1)")
+    p.add_argument("--lot-size", type=int, default=LOT_SIZE, help="units per Nifty lot (default 65)")
+    p.add_argument("--brokerage", type=float, default=BROKERAGE_PER_ORDER, help="Rs per order (default 20)")
     p.add_argument("--no-browser", action="store_true", help="don't open the dashboard automatically")
     p.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_tracker_data"),
                    help="output folder (default: nifty_tracker_data next to this script)")
-    run(p.parse_args())
+    args = p.parse_args()
+    LOTS, LOT_SIZE, BROKERAGE_PER_ORDER = max(1, args.lots), max(1, args.lot_size), max(0.0, args.brokerage)
+    run(args)
 
 
 if __name__ == "__main__":

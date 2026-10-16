@@ -71,6 +71,7 @@ TUNABLES = [
 DEFAULTS = {
     "data_dir": os.path.join(app_dir(), "nifty_tracker_data"),
     "theme": "auto", "sound": True, "notify": True, "notify_all": False, "autostart": False,
+    "lots": engine.LOTS, "lot_size": engine.LOT_SIZE, "brokerage": engine.BROKERAGE_PER_ORDER,
     "tunables": {k: getattr(engine, k) for k, *_ in TUNABLES},
 }
 
@@ -98,6 +99,32 @@ def save_settings(s):
 def apply_tunables(s):
     for k, v in s["tunables"].items():
         setattr(engine, k, v)
+    apply_money(s)
+
+
+def apply_money(s):
+    """Position size and costs used for the 'profit if you had taken every idea' figures."""
+    engine.LOTS = max(1, int(s.get("lots", engine.LOTS)))
+    engine.LOT_SIZE = max(1, int(s.get("lot_size", engine.LOT_SIZE)))
+    engine.BROKERAGE_PER_ORDER = max(0.0, float(s.get("brokerage", engine.BROKERAGE_PER_ORDER)))
+
+
+def rs(x, sign=True):
+    """Rs 1,234 with a sign; Indian digit grouping for lakhs."""
+    v = abs(x)
+    whole = f"{v:,.0f}"
+    if v >= 1e5:
+        n = str(int(round(v)))
+        head, tail = n[:-3], n[-3:]
+        parts = []
+        while len(head) > 2:
+            parts.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            parts.insert(0, head)
+        whole = ",".join(parts + [tail])
+    pre = ("+" if x > 0 else "−" if x < 0 else "") if sign else ("−" if x < 0 else "")
+    return f"{pre}₹{whole}"
 
 
 # --------------------------------------------------------------------------- theme
@@ -922,6 +949,92 @@ class HistoryDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- signal feed
+class EquityWidget(QWidget):
+    """Running total (Rs) of closed trade ideas, one point per exit, with a zero line."""
+
+    def __init__(self):
+        super().__init__()
+        self.points = []
+        self.setMinimumHeight(150)
+        self.setMouseTracking(True)
+        self.hover = None
+
+    def set_points(self, pts):
+        self.points = pts
+        self.update()
+
+    def _geom(self):
+        vals = [0.0] + [v for _, v in self.points]
+        lo, hi = min(vals), max(vals)
+        if hi - lo < 1:
+            hi, lo = hi + 500, lo - 500
+        pad = (hi - lo) * 0.12
+        lo, hi = lo - pad, hi + pad
+        L, R, Tp, B = 78, 34, 12, 24
+        w, h = self.width() - L - R, self.height() - Tp - B
+        n = len(vals) - 1
+        xs = [L + w * (i / max(n, 1)) for i in range(len(vals))]
+        y = lambda v: Tp + (hi - v) / (hi - lo) * h
+        return vals, xs, y, lo, hi, L, R
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(T["card"]))
+        if not self.points:
+            p.setPen(QColor(T["ink2"]))
+            p.drawText(self.rect(), Qt.AlignCenter, "The running total appears after the first closed trade idea")
+            return
+        vals, xs, y, lo, hi, L, R = self._geom()
+        p.setPen(QPen(QColor(T["grid"]), 1))
+        p.drawLine(QPointF(L, y(0)), QPointF(self.width() - R, y(0)))
+        p.setPen(QColor(T["ink2"]))
+        for v in (0, max(vals), min(vals)):
+            if v == 0 or abs(v) > 1:
+                p.drawText(QRectF(0, y(v) - 9, L - 8, 18), Qt.AlignRight | Qt.AlignVCenter, rs(v) if v else "₹0")
+        col = QColor(T["up"] if vals[-1] >= 0 else T["dn"])
+        path = QPainterPath(QPointF(xs[0], y(vals[0])))
+        for x, v in zip(xs[1:], vals[1:]):
+            path.lineTo(QPointF(x, y(v)))
+        p.setPen(QPen(col, 2))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+        p.setBrush(col)
+        p.setPen(QPen(QColor(T["card"]), 2))
+        for x, v in zip(xs[1:], vals[1:]):
+            p.drawEllipse(QPointF(x, y(v)), 4.5, 4.5)
+        p.setPen(QColor(T["ink2"]))
+        for (t, _), x in zip(self.points, xs[1:]):
+            p.drawText(QRectF(x - 30, self.height() - 20, 60, 16), Qt.AlignCenter, f"{t:%H:%M}")
+        if self.hover is not None:
+            t, v = self.points[self.hover]
+            x, yy = xs[self.hover + 1], y(v)
+            txt = f"{t:%H:%M}  total {rs(v)}"
+            fm = QFontMetrics(p.font())
+            bw = fm.horizontalAdvance(txt) + 16
+            bx = min(max(x - bw / 2, 4), self.width() - bw - 4)
+            p.setBrush(QColor(T["tip"]))
+            p.setPen(QPen(QColor(T["line"]), 1))
+            p.drawRoundedRect(QRectF(bx, max(2, yy - 34), bw, 24), 6, 6)
+            p.setPen(QColor(T["ink"]))
+            p.drawText(QRectF(bx, max(2, yy - 34), bw, 24), Qt.AlignCenter, txt)
+
+    def mouseMoveEvent(self, e):
+        if not self.points:
+            return
+        vals, xs, *_ = self._geom()
+        px = e.position().x()
+        i = min(range(1, len(xs)), key=lambda j: abs(xs[j] - px))
+        new = i - 1 if abs(xs[i] - px) < 30 else None
+        if new != self.hover:
+            self.hover = new
+            self.update()
+
+    def leaveEvent(self, e):
+        self.hover = None
+        self.update()
+
+
 class SignalCard(QFrame):
     clicked = Signal(object)
 
@@ -1051,16 +1164,19 @@ class SignalFeed(QWidget):
                       f"<b style='color:{col};'>{esc(s['kind'])}</b>{badge}"
                       f"<span style='color:{T['ink2']};'>&nbsp;&nbsp;@ {s['price']:,.2f}</span>{new}")
         lay.addWidget(head)
-        det = QLabel(esc(s["text"]))
+        det = QLabel(str(s["text"]))
+        det.setTextFormat(Qt.PlainText)
         det.setWordWrap(True)
         lay.addWidget(det)
         if s.get("trade"):
-            tr = QLabel(esc(s["trade"]))
+            tr = QLabel(str(s["trade"]))
+            tr.setTextFormat(Qt.PlainText)
             tr.setWordWrap(True)
             tr.setStyleSheet("font-weight:600;" if s.get("plan") else f"color:{T['ink2']};")
             lay.addWidget(tr)
         if s.get("option"):
-            op = QLabel(esc(s["option"]))
+            op = QLabel(str(s["option"]))
+            op.setTextFormat(Qt.PlainText)
             op.setWordWrap(True)
             op.setStyleSheet(f"background:{T['atm']}; border-radius:6px; padding:5px 8px; font-weight:600;")
             lay.addWidget(op)
@@ -1070,9 +1186,13 @@ class SignalFeed(QWidget):
             when = f" at {r['exit_time']:%H:%M}" if r["exit_time"] else " (running)"
             opt = (f" · option {r['opt_pnl']:+,.1f} Rs/unit{'' if r['opt_real'] else ' est.'}"
                    if r["opt_pnl"] is not None else "")
-            res = QLabel(f"<b style='color:{rc};'>{r['status']}</b>{when} · {r['points']:+,.0f} pts{opt}")
+            m = r.get("money")
+            rs_txt = (f" · <b style='color:{T['up'] if m['net'] > 0 else T['dn'] if m['net'] < 0 else T['ink2']};'>"
+                      f"{'now ' if r['status'] == 'OPEN' else ''}{rs(m['net'])}</b> on {m['qty']} qty") if m else ""
+            res = QLabel(f"<b style='color:{rc};'>{r['status']}</b>{when} · {r['points']:+,.0f} pts{opt}{rs_txt}")
             lay.addWidget(res)
-        note = QLabel(esc(s["bias_note"]))
+        note = QLabel(str(s["bias_note"]))
+        note.setTextFormat(Qt.PlainText)
         note.setWordWrap(True)
         note.setObjectName("ts")
         lay.addWidget(note)
@@ -1117,6 +1237,27 @@ class SettingsDialog(QDialog):
         self.autostart.setChecked(self.s["autostart"])
         for w in (self.sound, self.notify, self.notify_all, self.autostart):
             fl.addRow("", w)
+        sep = QLabel("Profit calculation – 'if you had taken every idea'")
+        sep.setObjectName("tl")
+        fl.addRow(sep)
+        self.lots = QSpinBox()
+        self.lots.setRange(1, 100)
+        self.lots.setValue(int(self.s.get("lots", 1)))
+        self.lots.setToolTip("How many lots you would buy for each trade idea")
+        fl.addRow("Lots per idea", self.lots)
+        self.lot_size = QSpinBox()
+        self.lot_size.setRange(1, 1000)
+        self.lot_size.setValue(int(self.s.get("lot_size", 65)))
+        self.lot_size.setToolTip("Units per Nifty lot (65 from Jan 2026). Change only if NSE revises it.")
+        fl.addRow("Lot size (units)", self.lot_size)
+        self.brokerage = QDoubleSpinBox()
+        self.brokerage.setRange(0, 500)
+        self.brokerage.setDecimals(0)
+        self.brokerage.setValue(float(self.s.get("brokerage", 20)))
+        self.brokerage.setPrefix("₹ ")
+        self.brokerage.setToolTip("Your broker's charge per executed order (buy and sell are 2 orders). "
+                                  "STT, exchange fees, GST and stamp duty are added automatically.")
+        fl.addRow("Brokerage per order", self.brokerage)
         tabs.addTab(gen, "General")
 
         rules = QWidget()
@@ -1180,6 +1321,7 @@ class SettingsDialog(QDialog):
         s["theme"] = self.theme.currentText()
         s["sound"], s["notify"] = self.sound.isChecked(), self.notify.isChecked()
         s["notify_all"], s["autostart"] = self.notify_all.isChecked(), self.autostart.isChecked()
+        s["lots"], s["lot_size"], s["brokerage"] = self.lots.value(), self.lot_size.value(), self.brokerage.value()
         for key, (w, typ) in self.inputs.items():
             s["tunables"][key] = w.currentText() if typ is str else typ(w.value())
         return s
@@ -1192,6 +1334,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
+        apply_money(self.settings)
         self.worker, self.rec, self.next_wait = None, None, None
         self.running_mode, self.had_error = "", False
         self.snaps, self.signals = [], []
@@ -1289,8 +1432,8 @@ class MainWindow(QMainWindow):
         for i, (key, label) in enumerate([("nifty", "Nifty (5-min close)"), ("pcr", "PCR"),
                                           ("res", "Resistance · max call OI"), ("sup", "Support · max put OI"),
                                           ("mp", "Max pain"), ("vix", "India VIX"), ("trend", "15-min trend"),
-                                          ("pa", "Price action")]):
-            t = Tile(label, spark=key != "pa")
+                                          ("pa", "Price action"), ("pnl", "Profit if taken")]):
+            t = Tile(label, spark=key not in ("pa", "pnl"))
             t.clicked.connect(lambda k=key: self.show_tile_history(k))
             self.tiles[key] = t
             tiles.addWidget(t, 0, i)
@@ -1353,7 +1496,7 @@ class MainWindow(QMainWindow):
         self.chain.setItemDelegateForColumn(2, self.bar_delegate)
         self.chain.setItemDelegateForColumn(4, self.bar_delegate)
         self.tabs.addTab(self.chain, "Option chain")
-        self.tabs.addTab(self.build_scorecard(), "Scorecard")
+        self.tabs.addTab(self.build_scorecard(), "Profit && scorecard")
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.tabs.addTab(self.log, "Log")
@@ -1378,23 +1521,37 @@ class MainWindow(QMainWindow):
     def build_scorecard(self):
         w = QWidget()
         w.setObjectName("page")
-        v = QVBoxLayout(w)
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(0, 0, 0, 0)
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        inner.setObjectName("page")
+        v = QVBoxLayout(inner)
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(10)
+        self.money_note = QLabel("")
+        self.money_note.setObjectName("muted")
+        self.money_note.setWordWrap(True)
+        v.addWidget(self.money_note)
         g = QHBoxLayout()
         self.sc_tiles = {}
-        for key, label in (("ideas", "Trade ideas"), ("won", "Won / closed"), ("pts", "Net Nifty points"),
-                           ("opt", "Option P&L (Rs/unit)")):
+        for key, label in (("net", "Net profit today"), ("open", "Open trades (if closed now)"),
+                           ("gradeA", "Grade A only"), ("cap", "Money needed"), ("won", "Won / closed")):
             t = Tile(label, spark=False)
             self.sc_tiles[key] = t
             g.addWidget(t)
         v.addLayout(g)
+        self.equity = EquityWidget()
+        v.addWidget(self.equity)
         self.sc_grades = QLabel("")
         self.sc_grades.setObjectName("muted")
+        self.sc_grades.setWordWrap(True)
         v.addWidget(self.sc_grades)
-        self.trades = QTableWidget(0, 10)
-        self.trades.setHorizontalHeaderLabels(["Time", "Signal", "Grade", "Entry", "Stop", "Target", "Option",
-                                               "Result", "Nifty pts", "Option P&L"])
+        self.trades = QTableWidget(0, 9)
+        self.trades.setHorizontalHeaderLabels(["Time", "Grade", "Trade", "Buy ₹", "Exit ₹", "Result", "Qty",
+                                               "Charges", "Net profit"])
         self.trades.verticalHeader().hide()
         self.trades.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.trades.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1402,14 +1559,32 @@ class MainWindow(QMainWindow):
         self.trades.setShowGrid(False)
         hh = self.trades.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(6, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)
         self.trades.verticalHeader().setDefaultSectionSize(28)
-        v.addWidget(self.trades, 1)
+        self.trades.setMinimumHeight(170)
+        v.addWidget(self.trades)
+        hist_t = QLabel("Earlier days (live runs) – net profit if every idea was taken")
+        hist_t.setObjectName("tl")
+        v.addWidget(hist_t)
+        self.history = QTableWidget(0, 4)
+        self.history.setHorizontalHeaderLabels(["Day", "Trades", "Profitable", "Net profit"])
+        self.history.verticalHeader().hide()
+        self.history.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.history.setShowGrid(False)
+        self.history.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.history.verticalHeader().setDefaultSectionSize(26)
+        self.history.setMinimumHeight(120)
+        v.addWidget(self.history)
         rule = QLabel("Each idea is followed candle by candle: stop or target on later 5-min candles (stop counted "
-                      "first if both fall in one candle); open trades close at 15:30.")
+                      "first if both fall in one candle); open trades close at 15:30. Option exit price is the real "
+                      "LTP in live / re-test mode and an estimate in replay. Charges are approximate (brokerage, "
+                      "STT, exchange, GST, stamp). Change lots, lot size and brokerage in Settings.")
         rule.setObjectName("ts")
         rule.setWordWrap(True)
         v.addWidget(rule)
+        v.addStretch()
+        sc.setWidget(inner)
+        outer.addWidget(sc)
         return w
 
     # ---- theme
@@ -1499,6 +1674,7 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self.settings = dlg.result_settings()
             save_settings(self.settings)
+            apply_money(self.settings)
             self.status_folder.setText(f"Data folder: {self.settings['data_dir']}")
             self.apply_theme()
             if self.worker and self.worker.isRunning():
@@ -1784,41 +1960,88 @@ class MainWindow(QMainWindow):
 
     def refresh_scorecard(self):
         res = [s["result"] for s in self.signals if s.get("result")]
+        lots, size = engine.LOTS, engine.LOT_SIZE
+        self.money_note.setText(f"If you had bought {lots} lot{'s' if lots > 1 else ''} ({lots * size} units) of every "
+                                f"suggested option at the suggested price and sold at its stop, target or 15:30 – "
+                                f"after approx. charges (brokerage ₹{engine.BROKERAGE_PER_ORDER:.0f}/order + taxes)."
+                                + ("  Replay prices are estimates." if self.rec and self.rec.mode == "replay" else ""))
         self.trades.setRowCount(0)
         self.trade_rows = []
+        self.refresh_history()
+        col = lambda v: T["up"] if v > 0 else T["dn"] if v < 0 else None
         if not res:
-            self.sc_tiles["ideas"].set("0", "no trade ideas yet")
-            for k in ("won", "pts", "opt"):
-                self.sc_tiles[k].set("–", "")
+            for k, t in self.sc_tiles.items():
+                t.set("–", "no trade ideas yet" if k == "net" else "")
+            self.tiles["pnl"].set("–", "no trade ideas yet")
+            self.equity.set_points([])
             self.sc_grades.setText("")
             return
-        sc = engine.scorecard(res)
-        self.sc_tiles["ideas"].set(str(sc["trades"]), f"{sc['open']} still running")
-        self.sc_tiles["won"].set(f"{sc['wins']} / {sc['closed']}",
-                                 f"win rate {sc['win_rate']:.0f}%" if sc["win_rate"] is not None else "")
-        self.sc_tiles["pts"].set(f"{sc['points']:+,.0f}", "closed trades",
-                                 T["up"] if sc["points"] > 0 else T["dn"] if sc["points"] < 0 else None)
-        self.sc_tiles["opt"].set(f"{sc['opt_pnl']:+,.1f}", "× lot size",
-                                 T["up"] if sc["opt_pnl"] > 0 else T["dn"] if sc["opt_pnl"] < 0 else None)
-        self.sc_grades.setText("   ·   ".join(f"Grade {g}: {n} trades, {w} won, {p:+,.0f} pts"
-                                             for g, (n, w, p) in sc["by_grade"].items()))
+        sc, ms = engine.scorecard(res), engine.money_summary(res)
+        self.sc_tiles["net"].set(rs(ms["net"]), f"{ms['n_closed']} closed trade{'s' if ms['n_closed'] != 1 else ''}",
+                                 col(ms["net"]))
+        self.sc_tiles["open"].set(rs(ms["open"]) if ms["n_open"] else "–",
+                                  f"{ms['n_open']} running" if ms["n_open"] else "none running",
+                                  col(ms["open"]) if ms["n_open"] else None)
+        self.sc_tiles["gradeA"].set(rs(ms["grade_a"]), "only A ideas", col(ms["grade_a"]))
+        self.sc_tiles["cap"].set(rs(ms["capital"], sign=False), "per trade (max)")
+        self.sc_tiles["won"].set(f"{ms['wins']} / {ms['n_closed']}",
+                                 f"win rate {ms['wins'] / ms['n_closed'] * 100:.0f}%"
+                                 if ms["n_closed"] else "none closed yet")
+        total = ms["net"] + ms["open"]
+        self.tiles["pnl"].set(rs(total), f"{lots} lot · {ms['n_closed'] + ms['n_open']} ideas",
+                              col(total))
+        self.equity.set_points(ms["curve"])
+        self.sc_grades.setText("   ·   ".join(
+            f"Grade {g}: {n} trades, {w} won, {rs(sum(r['money']['net'] for r in res if r.get('money') and r['status'] != 'OPEN' and r['sig'].get('grade') == g))}"
+            for g, (n, w, p) in sc["by_grade"].items()))
         self.trade_rows = [x["sig"] for x in reversed(res)]
         self.trades.setRowCount(len(res))
         for r, x in enumerate(reversed(res)):
-            sg, p = x["sig"], x["sig"]["plan"]
-            rc = T["up"] if x["points"] > 0 else T["dn"] if x["points"] < 0 else T["ink2"]
-            cells = [f"{sg['time']:%H:%M}", sg["kind"], sg.get("grade", ""), f"{p['entry']:,.0f}", f"{p['stop']:,.0f}",
-                     f"{p['target']:,.0f}", f"{p['strike']:,.0f} {p['opt']} @ {p['prem']:,.1f}",
+            sg, p, m = x["sig"], x["sig"]["plan"], x.get("money")
+            net = m["net"] if m else 0
+            rc = T["up"] if net > 0 else T["dn"] if net < 0 else T["ink2"]
+            cells = [f"{sg['time']:%H:%M}", sg.get("grade", ""), f"BUY {p['strike']:,.0f} {p['opt']}",
+                     f"{p['prem']:,.1f}", f"{x['exit_prem']:,.1f}" if x.get("exit_prem") is not None else "–",
                      x["status"] + (f" {x['exit_time']:%H:%M}" if x["exit_time"] and "15:30" not in x["status"] else ""),
-                     f"{x['points']:+,.0f}", f"{x['opt_pnl']:+,.1f}" if x["opt_pnl"] is not None else "–"]
-            for col, text in enumerate(cells):
+                     str(m["qty"]) if m else "–", f"₹{m['charges']:,.0f}" if m else "–", rs(net) if m else "–"]
+            tip = (f"{sg['kind']} · Nifty entry {p['entry']:,.0f}, stop {p['stop']:,.0f}, target {p['target']:,.0f} · "
+                   f"{x['points']:+,.0f} Nifty pts" + (f" · invested {rs(m['buy'], sign=False)}" if m else ""))
+            for c, text in enumerate(cells):
                 it = QTableWidgetItem(text)
-                if col in (7, 8, 9):
+                it.setToolTip(tip if not (x["status"] == "OPEN" and c in (5, 8)) else "Still running – value if you closed it now")
+                if c in (3, 4, 6, 7, 8):
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if c in (5, 8):
                     it.setForeground(QColor(rc))
-                if col == 1:
+                if c == 8:
+                    f = it.font()
+                    f.setBold(True)
+                    it.setFont(f)
+                if c == 2:
                     it.setForeground(QColor(dir_color(sg["direction"])))
-                self.trades.setItem(r, col, it)
+                self.trades.setItem(r, c, it)
 
+    def refresh_history(self):
+        cur = os.path.basename(self.rec.folder) if self.rec else None
+        rows = engine.history_pnl(self.settings["data_dir"], exclude=cur)
+        self.history.setRowCount(len(rows) + (1 if rows else 0))
+        tot = [0, 0, 0.0]
+        for r, (d, n, w, net) in enumerate(rows):
+            tot = [tot[0] + n, tot[1] + w, tot[2] + net]
+            for c, text in enumerate([d, str(n), str(w), rs(net)]):
+                it = QTableWidgetItem(text)
+                if c == 3:
+                    it.setForeground(QColor(T["up"] if net > 0 else T["dn"] if net < 0 else T["ink2"]))
+                self.history.setItem(r, c, it)
+        if rows:
+            for c, text in enumerate(["Total", str(tot[0]), str(tot[1]), rs(tot[2])]):
+                it = QTableWidgetItem(text)
+                f = it.font()
+                f.setBold(True)
+                it.setFont(f)
+                if c == 3:
+                    it.setForeground(QColor(T["up"] if tot[2] > 0 else T["dn"] if tot[2] < 0 else T["ink2"]))
+                self.history.setItem(len(rows), c, it)
 
 def main():
     if os.name == "nt":
