@@ -497,23 +497,26 @@ def run_scan(root: str | Path = ".", progress=print) -> dict:
                               "rs_3m": "rs_vs_nifty_3m_%", "pct_from_52w_high": "from_52w_high_%",
                               "atr_pct": "atr_%"})
     xlsx = OUT_DIR / "nifty50_ai_scan.xlsx"
-    with pd.ExcelWriter(xlsx, engine="openpyxl") as xw:
-        fmt.to_excel(xw, "Ranking", index=False)
-        (fmt[fmt.symbol.isin(pick.symbol)] if not pick.empty else
-         pd.DataFrame({"note": ["No stock passed the steam-after-breakout filter today"]})
-         ).to_excel(xw, "Top pick", index=False)
-        if not motifs.empty:
-            motifs.drop(columns=["_vec", "_matched"]).to_excel(xw, "Cross-stock motifs", index=False)
-        pd.DataFrame(list(bt_stats.items()), columns=["metric", "value"]).to_excel(
-            xw, "Backtest", index=False)
-        if not bt_dec.empty:
-            bt_dec.to_excel(xw, "Backtest", index=False, startrow=len(bt_stats) + 3)
-        pd.DataFrame({"setting": ["reference", "window", "target/stop/horizon", "k",
-                                  "probability used in score"],
-                      "value": [f"{REFERENCE_SYMBOL} {ref_label}", WINDOW,
-                                f"+{TARGET_PCT:.0%} / -{STOP_PCT:.0%} / {HORIZON} bars",
-                                K_NEIGHBOURS, "yes" if model_ok else
-                                "no (failed out-of-sample test)"]}).to_excel(xw, "Settings", index=False)
+    try:
+        with pd.ExcelWriter(xlsx, engine="openpyxl") as xw:
+            fmt.to_excel(xw, sheet_name="Ranking", index=False)
+            (fmt[fmt.symbol.isin(pick.symbol)] if not pick.empty else
+             pd.DataFrame({"note": ["No stock passed the steam-after-breakout filter today"]})
+             ).to_excel(xw, sheet_name="Top pick", index=False)
+            if not motifs.empty:
+                motifs.drop(columns=["_vec", "_matched"]).to_excel(xw, sheet_name="Cross-stock motifs", index=False)
+            pd.DataFrame(list(bt_stats.items()), columns=["metric", "value"]).to_excel(xw, sheet_name="Backtest", index=False)
+            if not bt_dec.empty:
+                bt_dec.to_excel(xw, sheet_name="Backtest", index=False, startrow=len(bt_stats) + 3)
+            pd.DataFrame({"setting": ["reference", "window", "target/stop/horizon", "k",
+                                      "probability used in score"],
+                          "value": [f"{REFERENCE_SYMBOL} {ref_label}", WINDOW,
+                                    f"+{TARGET_PCT:.0%} / -{STOP_PCT:.0%} / {HORIZON} bars",
+                                    K_NEIGHBOURS, "yes" if model_ok else
+                                    "no (failed out-of-sample test)"]}).to_excel(xw, sheet_name="Settings", index=False)
+    except Exception as e:   # the report is a bonus; never lose the scan over it
+        _log(f"Excel report not written ({type(e).__name__}: {e}); results are still shown")
+        xlsx = None
 
     # ---- console summary ----
     _log("\nTOP 10")
@@ -525,13 +528,13 @@ def run_scan(root: str | Path = ".", progress=print) -> dict:
         _log(f"\nCROSS-STOCK MOTIFS ({len(motifs)})")
         _log(motifs[["source", "source_start", "source_end", "n_stocks_now",
                       "past_hit_rate", "stocks_now"]].to_string(index=False))
-    _log(f"\nSaved: {xlsx.resolve()}\nCharts: {(OUT_DIR / 'charts').resolve()}")
+    _log(f"\nSaved: {xlsx.resolve() if xlsx else '(no Excel)'}\nCharts: {(OUT_DIR / 'charts').resolve()}")
 
     result = {
         "as_of": str(max(df.index[-1] for df in data.values()).date()),
         "run_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "folder": str(OUT_DIR.resolve()),
-        "xlsx": str(xlsx.resolve()),
+        "xlsx": str(xlsx.resolve()) if xlsx else None,
         "reference": f"{REFERENCE_SYMBOL} {ref_label}",
         "model_used_in_score": bool(model_ok),
         "pick": pick.symbol.iloc[0] if not pick.empty else None,
