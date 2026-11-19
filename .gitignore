@@ -8,3 +8,8 @@ dist/
 *.exe
 __pycache__/
 *.pyc
+# local lock files, backups and archives
+.nifty_tracker*.lock
+*.backup*.py
+*.zip
+_to_delete/

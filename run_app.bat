@@ -6,5 +6,5 @@ if not defined PY (
   pause
   exit /b 1
 )
-%PY% -m pip install --quiet pyside6 requests
+%PY% -m pip install --quiet pyside6 requests curl_cffi
 %PY% nifty_app.py
