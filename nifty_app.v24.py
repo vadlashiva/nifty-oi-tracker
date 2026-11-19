@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (QMenu, QApplication, QMainWindow, QWidget, QFrame
                                QAbstractItemView, QStyle, QProgressBar)
 
 import nifty_oi_tracker_v24 as engine
+import stock_scan
 
 APP_NAME = "Nifty OI Tracker"
 VERSION = "1.0"
@@ -425,6 +426,118 @@ def esc(text):
     import html
     return html.escape(str(text))
 
+
+
+# --------------------------------------------------------------------------- daily F&O stock breakout scan
+class ScanWorker(QThread):
+    progress = Signal(int, int, str)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, data_dir):
+        super().__init__()
+        self.data_dir = data_dir
+
+    def run(self):
+        try:
+            self.done.emit(stock_scan.run_scan(self.data_dir, progress=lambda i, n, s: self.progress.emit(i, n, s)))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class StockScanDialog(QDialog):
+    """Nifty 50 (F&O) breakout screen on daily closes: one name with steam, plus the full list. Not advice."""
+    COLS = ["Stock", "Close", "52-wk high", "From high %", "1m %", "3m %", "RSI", "Vol x", "Status", "Trigger",
+            "Invalidation", "Score"]
+
+    def __init__(self, parent, data_dir):
+        super().__init__(parent)
+        self.data_dir, self.worker = data_dir, None
+        self.setWindowTitle("Stock scan - Nifty 50 F&O breakouts")
+        self.resize(1000, 560)
+        v = QVBoxLayout(self)
+        self.pick = QLabel("No scan yet. Press Run now (takes about a minute).")
+        self.pick.setWordWrap(True)
+        self.pick.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        f = self.pick.font(); f.setPointSize(f.pointSize() + 1); self.pick.setFont(f)
+        v.addWidget(self.pick)
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSortingEnabled(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        v.addWidget(self.table, 1)
+        self.bar = QProgressBar(); self.bar.setVisible(False)
+        v.addWidget(self.bar)
+        h = QHBoxLayout()
+        self.status = QLabel("Rules: breakout above, or within 3% of, the 52-week high; close > 50-day > 200-day average; "
+                             "1-month return at least +2%. Educational screen, not trading advice.")
+        self.status.setWordWrap(True)
+        h.addWidget(self.status, 1)
+        self.run_btn = QPushButton("Run now")
+        self.run_btn.clicked.connect(self.run_scan)
+        h.addWidget(self.run_btn)
+        close = QPushButton("Close"); close.clicked.connect(self.hide)
+        h.addWidget(close)
+        v.addLayout(h)
+        saved = stock_scan.latest_saved(data_dir)
+        if saved:
+            self.show_result(saved)
+
+    def run_scan(self):
+        if self.worker and self.worker.isRunning():
+            return
+        self.run_btn.setEnabled(False)
+        self.bar.setVisible(True); self.bar.setValue(0)
+        self.worker = ScanWorker(self.data_dir)
+        self.worker.progress.connect(lambda i, n, s: (self.bar.setMaximum(n), self.bar.setValue(i + 1),
+                                                       self.bar.setFormat(f"{s}  %v/%m")))
+        self.worker.done.connect(self._finished)
+        self.worker.failed.connect(lambda m: (self._reset(), self.pick.setText(f"Scan failed: {m}")))
+        self.worker.start()
+
+    def _reset(self):
+        self.run_btn.setEnabled(True); self.bar.setVisible(False)
+
+    def _finished(self, res):
+        self._reset()
+        self.show_result(res)
+        p = self.parent()
+        if p is not None and hasattr(p, "log_line"):
+            pk = res.get("pick")
+            p.log_line("Stock scan: " + (f"one name with steam - {pk['symbol']} (close {pk['close']:,.2f}, "
+                                         f"trigger {pk['trigger']:,.2f}, invalidation {pk['invalidation']:,.2f})."
+                                         if pk else "no stock meets the rules today."))
+
+    def show_result(self, res):
+        pk = res.get("pick")
+        when = res.get("run_at", "")[:16].replace("T", " ")
+        if pk:
+            self.pick.setText(f"<b>One name with steam ({when}):</b> " + esc(stock_scan.describe(pk, res["series"])))
+        else:
+            self.pick.setText(f"<b>Scan {when}:</b> no stock meets the rules today.")
+        rows = res.get("candidates", [])
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            status = "BREAKOUT" if r["breakout"] else "NEAR"
+            if r["steam"]:
+                status += " + volume"
+            if r["stretched"]:
+                status += " (stretched)"
+            vals = [r["symbol"], r["close"], r["high52"], r["from_high_pct"], round(100 * r["ret_1m"], 1),
+                    round(100 * r["ret_3m"], 1), r["rsi14"], r["vol_ratio"] or 0, status, r["trigger"],
+                    r["invalidation"], r["score"]]
+            for j, val in enumerate(vals):
+                it = QTableWidgetItem()
+                it.setData(Qt.DisplayRole, val)
+                if pk and r["symbol"] == pk["symbol"]:
+                    it.setBackground(QColor(46, 125, 50, 90))
+                self.table.setItem(i, j, it)
+        self.table.setSortingEnabled(True)
+        self.status.setText(f"{res.get('scanned', 0)} stocks scanned ({res.get('source', '')}); {len(rows)} qualify"
+                            + (f"; {len(res['failed'])} failed to download" if res.get("failed") else "")
+                            + ". End-of-day data. Educational screen, not trading advice.")
 
 # --------------------------------------------------------------------------- background work
 class Worker(QThread):
@@ -2569,6 +2682,334 @@ class SettingsDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- main window
+# --------------------------------------------------------------------------- Nifty 50 stock pattern scanner
+# Daily-chart scan of the 50 Nifty stocks (pattern_scanner.py): ranking, one "steam after breakout"
+# pick, cross-stock patterns and an out-of-sample test. Runs in its own thread; the OI tracking
+# carries on while it works. Results are saved under <data folder>/stock_scans/<date>/.
+def latest_scan(root):
+    base = os.path.join(root, "stock_scans")
+    try:
+        days = sorted((d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))), reverse=True)
+    except OSError:
+        return None
+    for d in days:
+        try:
+            with open(os.path.join(base, d, "result.json"), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+class ScanThread(QThread):
+    progress = Signal(str)
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, root):
+        super().__init__()
+        self.root = root
+
+    def run(self):
+        try:
+            import pattern_scanner
+        except ImportError as e:
+            self.failed.emit(f"The scanner needs extra packages ({e.name}). Close the app and run:\n"
+                             "pip install yfinance pandas numpy matplotlib scipy openpyxl")
+            return
+        try:
+            self.finished_ok.emit(pattern_scanner.run_scan(self.root, progress=self.progress.emit))
+        except Exception as e:  # never crash the window
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class ImageView(QLabel):
+    """Shows a PNG scaled to fit, keeping its shape."""
+    def __init__(self, empty_text=""):
+        super().__init__(empty_text)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(320, 220)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setObjectName("muted")
+        self._pix, self._empty = None, empty_text
+
+    def show_file(self, path, missing_text):
+        self._pix = QPixmap(path) if path and os.path.isfile(path) else None
+        if self._pix is None or self._pix.isNull():
+            self._pix = None
+            self.setPixmap(QPixmap())
+            self.setText(missing_text)
+        else:
+            self.setText("")
+            self._fit()
+
+    def _fit(self):
+        if self._pix:
+            self.setPixmap(self._pix.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._fit()
+
+
+class ScannerTab(QWidget):
+    COLS = [("rank", "#"), ("symbol", "Stock"), ("score", "Score"), ("trend", "Trend"),
+            ("patterns", "Patterns"), ("close", "Close"), ("breakout_level", "Breakout lvl"),
+            ("ext_above_level_%", "Above lvl %"), ("vol_ratio", "Vol ×"), ("rs_vs_nifty_3m_%", "RS 3m %"),
+            ("from_52w_high_%", "From 52w hi %"), ("breakout_prob_%", "Prob %"),
+            ("ref_similarity", "Cochin sim")]
+    TIPS = {"score": "Bullish score 0-100 (trend, breakout, averages, volume, strength vs Nifty, Cochin "
+                     "similarity; the probability counts only if it passed the out-of-sample test)",
+            "ext_above_level_%": "How far the close is above the breakout level - above 6% is chasing",
+            "vol_ratio": "Today's volume ÷ 20-day average",
+            "rs_vs_nifty_3m_%": "3-month return relative to the Nifty",
+            "breakout_prob_%": "Share of the 40 most similar past charts that hit +8% before -4% in 20 days",
+            "ref_similarity": "Shape match (-1 to 1) with Cochin Shipyard's base before its big run"}
+
+    def __init__(self, root_fn, log_fn):
+        super().__init__()
+        self.setObjectName("page")
+        self.root_fn, self.log_fn = root_fn, log_fn
+        self.thread, self.result = None, None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
+        bar = QHBoxLayout()
+        self.run_btn = QPushButton("Run scan")
+        self.run_btn.setObjectName("primary")
+        self.run_btn.setToolTip("Download 5 years of daily data for the Nifty 50 and scan it (about a minute)")
+        self.run_btn.clicked.connect(self.run_scan)
+        bar.addWidget(self.run_btn)
+        self.status = QLabel("No scan yet - press Run scan (best after 3:30 pm, on the day's close)")
+        self.status.setObjectName("muted")
+        bar.addWidget(self.status, 1)
+        self.folder_btn = QToolButton()
+        self.folder_btn.setText("Open folder")
+        self.folder_btn.clicked.connect(lambda: self._open("folder"))
+        self.xlsx_btn = QToolButton()
+        self.xlsx_btn.setText("Open Excel")
+        self.xlsx_btn.clicked.connect(lambda: self._open("xlsx"))
+        for b in (self.folder_btn, self.xlsx_btn):
+            b.setEnabled(False)
+            bar.addWidget(b)
+        v.addLayout(bar)
+
+        self.pick = QLabel()
+        self.pick.setWordWrap(True)
+        self.pick.setTextFormat(Qt.RichText)
+        v.addWidget(self.pick)
+        self.note = QLabel()
+        self.note.setWordWrap(True)
+        self.note.setObjectName("ts")
+        v.addWidget(self.note)
+
+        self.sub = QTabWidget()
+        # ranking + chart
+        rk = QSplitter(Qt.Horizontal)
+        self.table = self._table([h for _, h in self.COLS])
+        for i, (k, _) in enumerate(self.COLS):
+            if k in self.TIPS:
+                self.table.horizontalHeaderItem(i).setToolTip(self.TIPS[k])
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Interactive)
+        self.table.setColumnWidth(4, 260)
+        self.table.itemSelectionChanged.connect(self._show_stock_chart)
+        rk.addWidget(self.table)
+        self.chart = ImageView("Select a stock to see its chart")
+        rk.addWidget(self.chart)
+        rk.setSizes([760, 440])
+        self.sub.addTab(rk, "Ranking")
+        # motifs + chart
+        mt = QSplitter(Qt.Vertical)
+        self.motifs = self._table(["Source stock", "Source window", "Live in", "Stocks now",
+                                   "Past look-alikes", "Past hit %", "Past median 20d %"])
+        self.motifs.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.motifs.itemSelectionChanged.connect(self._show_motif_chart)
+        mt.addWidget(self.motifs)
+        self.motif_chart = ImageView("Select a pattern to see the overlay")
+        mt.addWidget(self.motif_chart)
+        mt.setSizes([180, 320])
+        self.sub.addTab(mt, "Cross-stock patterns")
+        # backtest
+        self.bt = QPlainTextEdit()
+        self.bt.setReadOnly(True)
+        self.sub.addTab(self.bt, "Out-of-sample test")
+        v.addWidget(self.sub, 1)
+
+        try:
+            self.show_result(latest_scan(self.root_fn()))
+        except Exception:
+            pass
+
+    def _table(self, headers):
+        t = QTableWidget(0, len(headers))
+        t.setHorizontalHeaderLabels(headers)
+        t.verticalHeader().hide()
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.setSelectionMode(QAbstractItemView.SingleSelection)
+        t.setSelectionBehavior(QAbstractItemView.SelectRows)
+        t.setShowGrid(False)
+        t.setSortingEnabled(True)
+        t.verticalHeader().setDefaultSectionSize(28)
+        t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        return t
+
+    @staticmethod
+    def _item(value):
+        it = QTableWidgetItem()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            it.setData(Qt.DisplayRole, round(value, 2) if isinstance(value, float) else value)
+            it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        else:
+            it.setText("-" if value is None else str(value))
+        return it
+
+    # ---- running
+    def run_scan(self):
+        if self.thread and self.thread.isRunning():
+            return
+        self.run_btn.setEnabled(False)
+        self.run_btn.setText("Scanning…")
+        self.status.setText("Starting…")
+        self.thread = ScanThread(self.root_fn())
+        self.thread.progress.connect(self._progress)
+        self.thread.finished_ok.connect(self._done)
+        self.thread.failed.connect(self._failed)
+        self.thread.start()
+
+    def _progress(self, text):
+        line = text.strip().splitlines()[0] if text.strip() else ""
+        if line:
+            self.status.setText(line[:140])
+        self.log_fn("Scanner: " + text.strip())
+
+    def _done(self, result):
+        self._reset_btn()
+        self.show_result(result)
+        self.log_fn(f"Scanner: done - pick {result.get('pick') or 'none'}; saved in {result.get('folder')}")
+
+    def _failed(self, msg):
+        self._reset_btn()
+        self.status.setText("Scan failed - see the Log tab")
+        self.log_fn("Scanner error: " + msg)
+        QMessageBox.warning(self, "Stock scanner", msg)
+
+    def _reset_btn(self):
+        self.run_btn.setEnabled(True)
+        self.run_btn.setText("Run scan")
+
+    def _open(self, key):
+        if self.result and self.result.get(key):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.result[key]))
+
+    # ---- showing
+    def show_result(self, r):
+        if not r:
+            return
+        self.result = r
+        self.folder_btn.setEnabled(True)
+        self.xlsx_btn.setEnabled(True)
+        self.status.setText(f"Data to {r['as_of']} · scanned {r['run_at']} · reference {r['reference']}")
+        rows = r.get("ranking", [])
+        by_sym = {x["symbol"]: x for x in rows}
+        p = by_sym.get(r.get("pick"))
+        if p:
+            self.pick.setText(
+                f"<b>Steam-after-breakout pick: <span style='color:{T['up']}'>{esc(p['symbol'])}</span></b>"
+                f" &nbsp;close {p['close']} · breakout level {p['breakout_level']} "
+                f"({p['ext_above_level_%']:+.1f}%) · volume {p['vol_ratio']:.1f}× · "
+                f"RS vs Nifty {p['rs_vs_nifty_3m_%']:+.1f}% · {p['from_52w_high_%']:.1f}% from 52-week high"
+                f" · {esc(p['patterns'])}")
+        else:
+            self.pick.setText("<b>Steam-after-breakout pick:</b> none today - no stock passed the filter "
+                              "(fresh breakout ≤5% above its level, volume ≥1.3×, beating the Nifty, "
+                              "20-day avg above 50-day)")
+        bt = r.get("backtest", {})
+        if r.get("model_used_in_score"):
+            self.note.setText(f"The breakout-probability model passed its out-of-sample test "
+                              f"(skill {bt.get('skill_vs_base_%')}%) and counts in the score.")
+            self.note.setStyleSheet("")
+        else:
+            self.note.setText(f"The breakout-probability model did NOT beat the base rate out-of-sample "
+                              f"(skill {bt.get('skill_vs_base_%', '?')}%), so its probability is shown "
+                              f"but left out of the score.")
+            self.note.setStyleSheet(f"color:{T['warn']};")
+
+        t = self.table
+        t.setSortingEnabled(False)
+        t.setRowCount(len(rows))
+        for i, row in enumerate(rows):
+            for j, (k, _) in enumerate(self.COLS):
+                it = self._item(row.get(k))
+                if k == "symbol" and row["symbol"] == r.get("pick"):
+                    it.setForeground(QColor(T["up"]))
+                    f = it.font()
+                    f.setBold(True)
+                    it.setFont(f)
+                elif k == "trend":
+                    it.setForeground(QColor(T["up"] if str(row[k]).startswith("Up") else
+                                            T["dn"] if str(row[k]).startswith("Down") else T["ink2"]))
+                elif k in ("rs_vs_nifty_3m_%",) and isinstance(row.get(k), (int, float)):
+                    it.setForeground(QColor(T["up"] if row[k] > 0 else T["dn"]))
+                if k == "patterns":
+                    it.setToolTip(str(row.get(k)))
+                t.setItem(i, j, it)
+        t.setSortingEnabled(True)
+        t.sortByColumn(0, Qt.AscendingOrder)
+        t.setColumnWidth(4, 260)
+
+        m = r.get("motifs", [])
+        mt = self.motifs
+        mt.setSortingEnabled(False)
+        mt.setRowCount(len(m))
+        for i, x in enumerate(m):
+            vals = [x["source"], f"{str(x['source_start'])[:10]} → {str(x['source_end'])[:10]}",
+                    x["n_stocks_now"], x["stocks_now"], x.get("past_lookalikes"),
+                    None if x.get("past_hit_rate") is None else round(100 * x["past_hit_rate"], 1),
+                    None if x.get("past_median_20d_ret") is None else round(100 * x["past_median_20d_ret"], 2)]
+            for j, val in enumerate(vals):
+                it = self._item(val)
+                it.setData(Qt.UserRole, i)
+                if j == 3:
+                    it.setToolTip(str(val))
+                mt.setItem(i, j, it)
+        mt.setSortingEnabled(True)
+        mt.sortByColumn(2, Qt.DescendingOrder)
+        if not m:
+            self.motif_chart.show_file(None, "No pattern is live in 5 or more other stocks right now")
+
+        lines = [f"Analogue model: k-nearest past charts → P(+{100 * r['settings']['target']:.0f}% before "
+                 f"-{100 * r['settings']['stop']:.0f}% within {r['settings']['horizon']} days)",
+                 "Trained only on windows before the test period; scored on the test period.", ""]
+        lines += [f"{k:<22}{v}" for k, v in bt.items()]
+        if r.get("backtest_deciles"):
+            lines += ["", "Decile  windows  predicted  actual  avg 20d ret"]
+            for d in r["backtest_deciles"]:
+                lines.append(f"{d['decile']:>6}  {d['windows']:>7}  {100 * d['pred_prob']:>8.1f}%  "
+                             f"{100 * d['actual_hit_rate']:>5.1f}%  {100 * d['avg_fwd_ret']:>+8.2f}%")
+            lines += ["", "A useful model shows 'actual' rising from decile 1 to 10."]
+        self.bt.setPlainText("\n".join(lines))
+        if rows:
+            t.selectRow(0)
+
+    def _show_stock_chart(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows or not self.result:
+            return
+        sym = self.table.item(rows[0].row(), 1).text()
+        self.chart.show_file(os.path.join(self.result["folder"], "charts", f"{sym}.png"),
+                             f"Charts are saved for the top 10 only.\n{sym} is not in the top 10.")
+
+    def _show_motif_chart(self):
+        rows = self.motifs.selectionModel().selectedRows()
+        if not rows or not self.result:
+            return
+        i = self.motifs.item(rows[0].row(), 0).data(Qt.UserRole)
+        src = self.result["motifs"][i]["source"]
+        self.motif_chart.show_file(os.path.join(self.result["folder"], "charts", f"motif_{i + 1}_{src}.png"),
+                                   "Chart not found")
+
+
 class MainWindow(QMainWindow):
     MODES = [("live", "Live (market hours)"), ("replay", "Replay last session"), ("retest", "Re-test a recorded day")]
 
@@ -2617,6 +3058,10 @@ class MainWindow(QMainWindow):
         self._review_timer.timeout.connect(lambda: self.maybe_weekly_review(prompt=False))
         self._review_timer.start(30 * 60 * 1000)
         QTimer.singleShot(4000, self.load_outlook_history)
+        self._scan_timer = QTimer(self)                  # daily stock scan after the close
+        self._scan_timer.timeout.connect(self.maybe_auto_scan)
+        self._scan_timer.start(5 * 60 * 1000)
+        QTimer.singleShot(6000, self.maybe_auto_scan)
 
     # ---- layout
     def build(self):
@@ -2690,6 +3135,11 @@ class MainWindow(QMainWindow):
         self.ideas_btn.setToolTip("Open the trade-ideas window: buy or sell option for every idea (Ctrl+T)")
         self.ideas_btn.clicked.connect(self.show_ideas)
         h.addWidget(self.ideas_btn)
+        self.scan_btn = QToolButton()
+        self.scan_btn.setText("Stock scan")
+        self.scan_btn.setToolTip("Daily Nifty 50 F&O breakout scan: one stock with steam, trigger and invalidation (Ctrl+K)")
+        self.scan_btn.clicked.connect(self.show_stock_scan)
+        h.addWidget(self.scan_btn)
         b = QToolButton()
         b.setText("Settings")
         b.setToolTip("Settings and signal rules")
@@ -2815,6 +3265,8 @@ class MainWindow(QMainWindow):
         self.chain.setItemDelegateForColumn(4, self.bar_delegate)
         self.tabs.addTab(self.chain, "Option chain")
         self.tabs.addTab(self.build_scorecard(), "Profit && scorecard")
+        self.scanner = ScannerTab(lambda: self.settings["data_dir"], self.log_line)
+        self.tabs.addTab(self.scanner, "Stock scanner")
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.tabs.addTab(self.log, "Log")
@@ -3416,7 +3868,7 @@ class MainWindow(QMainWindow):
 
     # ---- interaction
     def build_shortcuts(self):
-        keys = [("Ctrl+T", self.show_ideas), ("F5", self.toggle), ("Esc", lambda: self.select_signal(None)),
+        keys = [("Ctrl+T", self.show_ideas), ("Ctrl+K", self.show_stock_scan), ("F5", self.toggle), ("Esc", lambda: self.select_signal(None)),
                 ("Ctrl+Up", lambda: self.step_signal(-1)), ("Ctrl+Down", lambda: self.step_signal(1)),
                 ("Ctrl+0", self.chart.reset_view), ("Ctrl+=", lambda: self.chart.zoom(0.8, 1.0)),
                 ("Ctrl++", lambda: self.chart.zoom(0.8, 1.0)), ("Ctrl+-", lambda: self.chart.zoom(1.25, 1.0))]
@@ -3435,6 +3887,25 @@ class MainWindow(QMainWindow):
         self.ideas.show()
         self.ideas.raise_()
         self.ideas.activateWindow()
+
+    def show_stock_scan(self, auto=False):
+        if getattr(self, "scan_dlg", None) is None:
+            self.scan_dlg = StockScanDialog(self, self.settings["data_dir"])
+        if auto:
+            self.scan_dlg.run_scan()
+            return
+        self.scan_dlg.show(); self.scan_dlg.raise_(); self.scan_dlg.activateWindow()
+
+    def maybe_auto_scan(self):
+        """Once per weekday after 15:45 (after the close), run the stock scan in the background."""
+        now = dt.datetime.now()
+        if now.weekday() >= 5 or (now.hour, now.minute) < (15, 45):
+            return
+        f = os.path.join(self.settings["data_dir"], f"stock_scan_{now:%Y-%m-%d}.json")
+        if os.path.exists(f) or getattr(self, "_scan_auto_day", None) == now.date():
+            return
+        self._scan_auto_day = now.date()
+        self.show_stock_scan(auto=True)
 
     def show_idea_charts(self):
         self.idea_win.show()
@@ -3534,6 +4005,8 @@ class MainWindow(QMainWindow):
     def refresh_all(self):
         if not hasattr(self, "tiles"):
             return
+        if getattr(self, "scanner", None) and self.scanner.result:
+            self.scanner.show_result(self.scanner.result)
         if self.snaps:
             try:
                 engine.evaluate_trades(self.snaps, self.signals)

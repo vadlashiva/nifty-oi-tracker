@@ -8,10 +8,10 @@ echo Using Python: %PY%
 %PY% --version
 echo.
 echo [1/2] Installing PySide6, requests, curl_cffi and PyInstaller ...
-%PY% -m pip install --upgrade pyside6 requests curl_cffi pyinstaller || goto :err
+%PY% -m pip install --upgrade pyside6 requests curl_cffi yfinance pandas numpy matplotlib scipy openpyxl pyinstaller || goto :err
 echo.
 echo [2/2] Building the app (1-3 minutes) ...
-%PY% -m PyInstaller --noconfirm --onefile --windowed --name NiftyOITracker_v24 --icon app.ico --add-data "app.ico;." --collect-all curl_cffi nifty_app.v24.py || goto :err
+%PY% -m PyInstaller --noconfirm --onefile --windowed --name NiftyOITracker_v24 --icon app.ico --add-data "app.ico;." --collect-all curl_cffi --collect-all yfinance --hidden-import pattern_scanner nifty_app.v24.py || goto :err
 copy /y dist\NiftyOITracker.exe . >nul
 rmdir /s /q build >nul 2>&1
 del /q NiftyOITracker.spec >nul 2>&1
