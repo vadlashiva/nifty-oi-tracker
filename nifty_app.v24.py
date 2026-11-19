@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (QMenu, QApplication, QMainWindow, QWidget, QFrame
                                QAbstractItemView, QStyle, QProgressBar)
 
 import nifty_oi_tracker_v24 as engine
+import stock_scan
 
 APP_NAME = "Nifty OI Tracker"
 VERSION = "1.0"
@@ -425,6 +426,118 @@ def esc(text):
     import html
     return html.escape(str(text))
 
+
+
+# --------------------------------------------------------------------------- daily F&O stock breakout scan
+class ScanWorker(QThread):
+    progress = Signal(int, int, str)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, data_dir):
+        super().__init__()
+        self.data_dir = data_dir
+
+    def run(self):
+        try:
+            self.done.emit(stock_scan.run_scan(self.data_dir, progress=lambda i, n, s: self.progress.emit(i, n, s)))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class StockScanDialog(QDialog):
+    """Nifty 50 (F&O) breakout screen on daily closes: one name with steam, plus the full list. Not advice."""
+    COLS = ["Stock", "Close", "52-wk high", "From high %", "1m %", "3m %", "RSI", "Vol x", "Status", "Trigger",
+            "Invalidation", "Score"]
+
+    def __init__(self, parent, data_dir):
+        super().__init__(parent)
+        self.data_dir, self.worker = data_dir, None
+        self.setWindowTitle("Stock scan - Nifty 50 F&O breakouts")
+        self.resize(1000, 560)
+        v = QVBoxLayout(self)
+        self.pick = QLabel("No scan yet. Press Run now (takes about a minute).")
+        self.pick.setWordWrap(True)
+        self.pick.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        f = self.pick.font(); f.setPointSize(f.pointSize() + 1); self.pick.setFont(f)
+        v.addWidget(self.pick)
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSortingEnabled(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        v.addWidget(self.table, 1)
+        self.bar = QProgressBar(); self.bar.setVisible(False)
+        v.addWidget(self.bar)
+        h = QHBoxLayout()
+        self.status = QLabel("Rules: breakout above, or within 3% of, the 52-week high; close > 50-day > 200-day average; "
+                             "1-month return at least +2%. Educational screen, not trading advice.")
+        self.status.setWordWrap(True)
+        h.addWidget(self.status, 1)
+        self.run_btn = QPushButton("Run now")
+        self.run_btn.clicked.connect(self.run_scan)
+        h.addWidget(self.run_btn)
+        close = QPushButton("Close"); close.clicked.connect(self.hide)
+        h.addWidget(close)
+        v.addLayout(h)
+        saved = stock_scan.latest_saved(data_dir)
+        if saved:
+            self.show_result(saved)
+
+    def run_scan(self):
+        if self.worker and self.worker.isRunning():
+            return
+        self.run_btn.setEnabled(False)
+        self.bar.setVisible(True); self.bar.setValue(0)
+        self.worker = ScanWorker(self.data_dir)
+        self.worker.progress.connect(lambda i, n, s: (self.bar.setMaximum(n), self.bar.setValue(i + 1),
+                                                       self.bar.setFormat(f"{s}  %v/%m")))
+        self.worker.done.connect(self._finished)
+        self.worker.failed.connect(lambda m: (self._reset(), self.pick.setText(f"Scan failed: {m}")))
+        self.worker.start()
+
+    def _reset(self):
+        self.run_btn.setEnabled(True); self.bar.setVisible(False)
+
+    def _finished(self, res):
+        self._reset()
+        self.show_result(res)
+        p = self.parent()
+        if p is not None and hasattr(p, "log_line"):
+            pk = res.get("pick")
+            p.log_line("Stock scan: " + (f"one name with steam - {pk['symbol']} (close {pk['close']:,.2f}, "
+                                         f"trigger {pk['trigger']:,.2f}, invalidation {pk['invalidation']:,.2f})."
+                                         if pk else "no stock meets the rules today."))
+
+    def show_result(self, res):
+        pk = res.get("pick")
+        when = res.get("run_at", "")[:16].replace("T", " ")
+        if pk:
+            self.pick.setText(f"<b>One name with steam ({when}):</b> " + esc(stock_scan.describe(pk, res["series"])))
+        else:
+            self.pick.setText(f"<b>Scan {when}:</b> no stock meets the rules today.")
+        rows = res.get("candidates", [])
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            status = "BREAKOUT" if r["breakout"] else "NEAR"
+            if r["steam"]:
+                status += " + volume"
+            if r["stretched"]:
+                status += " (stretched)"
+            vals = [r["symbol"], r["close"], r["high52"], r["from_high_pct"], round(100 * r["ret_1m"], 1),
+                    round(100 * r["ret_3m"], 1), r["rsi14"], r["vol_ratio"] or 0, status, r["trigger"],
+                    r["invalidation"], r["score"]]
+            for j, val in enumerate(vals):
+                it = QTableWidgetItem()
+                it.setData(Qt.DisplayRole, val)
+                if pk and r["symbol"] == pk["symbol"]:
+                    it.setBackground(QColor(46, 125, 50, 90))
+                self.table.setItem(i, j, it)
+        self.table.setSortingEnabled(True)
+        self.status.setText(f"{res.get('scanned', 0)} stocks scanned ({res.get('source', '')}); {len(rows)} qualify"
+                            + (f"; {len(res['failed'])} failed to download" if res.get("failed") else "")
+                            + ". End-of-day data. Educational screen, not trading advice.")
 
 # --------------------------------------------------------------------------- background work
 class Worker(QThread):
@@ -2617,6 +2730,10 @@ class MainWindow(QMainWindow):
         self._review_timer.timeout.connect(lambda: self.maybe_weekly_review(prompt=False))
         self._review_timer.start(30 * 60 * 1000)
         QTimer.singleShot(4000, self.load_outlook_history)
+        self._scan_timer = QTimer(self)                  # daily stock scan after the close
+        self._scan_timer.timeout.connect(self.maybe_auto_scan)
+        self._scan_timer.start(5 * 60 * 1000)
+        QTimer.singleShot(6000, self.maybe_auto_scan)
 
     # ---- layout
     def build(self):
@@ -2690,6 +2807,11 @@ class MainWindow(QMainWindow):
         self.ideas_btn.setToolTip("Open the trade-ideas window: buy or sell option for every idea (Ctrl+T)")
         self.ideas_btn.clicked.connect(self.show_ideas)
         h.addWidget(self.ideas_btn)
+        self.scan_btn = QToolButton()
+        self.scan_btn.setText("Stock scan")
+        self.scan_btn.setToolTip("Daily Nifty 50 F&O breakout scan: one stock with steam, trigger and invalidation (Ctrl+K)")
+        self.scan_btn.clicked.connect(self.show_stock_scan)
+        h.addWidget(self.scan_btn)
         b = QToolButton()
         b.setText("Settings")
         b.setToolTip("Settings and signal rules")
@@ -3416,7 +3538,7 @@ class MainWindow(QMainWindow):
 
     # ---- interaction
     def build_shortcuts(self):
-        keys = [("Ctrl+T", self.show_ideas), ("F5", self.toggle), ("Esc", lambda: self.select_signal(None)),
+        keys = [("Ctrl+T", self.show_ideas), ("Ctrl+K", self.show_stock_scan), ("F5", self.toggle), ("Esc", lambda: self.select_signal(None)),
                 ("Ctrl+Up", lambda: self.step_signal(-1)), ("Ctrl+Down", lambda: self.step_signal(1)),
                 ("Ctrl+0", self.chart.reset_view), ("Ctrl+=", lambda: self.chart.zoom(0.8, 1.0)),
                 ("Ctrl++", lambda: self.chart.zoom(0.8, 1.0)), ("Ctrl+-", lambda: self.chart.zoom(1.25, 1.0))]
@@ -3435,6 +3557,25 @@ class MainWindow(QMainWindow):
         self.ideas.show()
         self.ideas.raise_()
         self.ideas.activateWindow()
+
+    def show_stock_scan(self, auto=False):
+        if getattr(self, "scan_dlg", None) is None:
+            self.scan_dlg = StockScanDialog(self, self.settings["data_dir"])
+        if auto:
+            self.scan_dlg.run_scan()
+            return
+        self.scan_dlg.show(); self.scan_dlg.raise_(); self.scan_dlg.activateWindow()
+
+    def maybe_auto_scan(self):
+        """Once per weekday after 15:45 (after the close), run the stock scan in the background."""
+        now = dt.datetime.now()
+        if now.weekday() >= 5 or (now.hour, now.minute) < (15, 45):
+            return
+        f = os.path.join(self.settings["data_dir"], f"stock_scan_{now:%Y-%m-%d}.json")
+        if os.path.exists(f) or getattr(self, "_scan_auto_day", None) == now.date():
+            return
+        self._scan_auto_day = now.date()
+        self.show_stock_scan(auto=True)
 
     def show_idea_charts(self):
         self.idea_win.show()
