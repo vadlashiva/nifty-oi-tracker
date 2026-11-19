@@ -2908,7 +2908,7 @@ class ScannerTab(QWidget):
             return
         self.result = r
         self.folder_btn.setEnabled(True)
-        self.xlsx_btn.setEnabled(True)
+        self.xlsx_btn.setEnabled(bool(r.get("xlsx")))
         self.status.setText(f"Data to {r['as_of']} · scanned {r['run_at']} · reference {r['reference']}")
         rows = r.get("ranking", [])
         by_sym = {x["symbol"]: x for x in rows}
