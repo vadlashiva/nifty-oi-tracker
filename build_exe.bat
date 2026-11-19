@@ -7,11 +7,11 @@ if not defined PY goto :nopython
 echo Using Python: %PY%
 %PY% --version
 echo.
-echo [1/2] Installing PySide6, requests and PyInstaller ...
-%PY% -m pip install --upgrade pyside6 requests pyinstaller || goto :err
+echo [1/2] Installing PySide6, requests, curl_cffi and PyInstaller ...
+%PY% -m pip install --upgrade pyside6 requests curl_cffi pyinstaller || goto :err
 echo.
 echo [2/2] Building the app (1-3 minutes) ...
-%PY% -m PyInstaller --noconfirm --onefile --windowed --name NiftyOITracker --icon app.ico --add-data "app.ico;." nifty_app.py || goto :err
+%PY% -m PyInstaller --noconfirm --onefile --windowed --name NiftyOITracker --icon app.ico --add-data "app.ico;." --collect-all curl_cffi nifty_app.py || goto :err
 copy /y dist\NiftyOITracker.exe . >nul
 rmdir /s /q build >nul 2>&1
 del /q NiftyOITracker.spec >nul 2>&1
