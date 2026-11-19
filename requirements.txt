@@ -1,3 +1,10 @@
 pyside6>=6.5
 requests
 curl_cffi
+# Stock scanner tab (pattern_scanner.py)
+yfinance
+pandas
+numpy
+matplotlib
+scipy
+openpyxl
